@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from openai import OpenAI
 from dotenv import load_dotenv
 import os
@@ -20,6 +22,31 @@ client = OpenAI(
     max_retries=1,
 )
 
+WORKDIR = Path(subprocess.run("pwd",shell=True,capture_output=True,text=True).stdout.strip())
+
+PERMISSION_RULES = [
+    {
+        "tools": ["run_bash_command", "read_file"],
+        "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
+        "message": "Writing outside workspace",
+    },
+    {
+        "tools": ["run_bash_command"],
+        "check": lambda args: any(kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]),
+        "message": "Potentially destructive command",
+    },
+]
+
+def check_rules(tool_name: str, args: dict) -> str | None:
+    for rule in PERMISSION_RULES:
+        if tool_name in rule["tools"] and rule["check"](args):
+            return rule["message"]
+    return None
+
+def ask_user(tool_name: str, args: dict) -> bool:
+    user_res = input(f"Tool '{tool_name}' is requesting to run with arguments {args}. Do you allow this? (y/n): ")
+    return user_res.lower() == "y"
+
 class ToolModel(BaseModel):
     name: str
     description: str
@@ -36,27 +63,11 @@ def run_bash_command(cmd: str) -> str:
         "return_code": result.returncode
     }
     return json.dumps(parsed_result)
-
-def is_safe_path(path: str):
-    # Read must happen in current directory only
-    result = subprocess.run("pwd",shell=True,capture_output=True,text=True)
-    current_dir = result.stdout
-
-    if current_dir in path:
-        return True
-    else:
-        return False
-
-    # Add other conditions subsequently
     
 def read_file(path: str) -> str:
     """
     Reads the file and returns the content of the file
     """
-    if not is_safe_path(path):
-        return json.dumps({
-            "err": "Not a safe path. The intented operation was not allowed."
-        })
     result = subprocess.run(f"cat {path}",shell=True,capture_output=True,text=True)
     parsed_result = {
             "stdout": result.stdout,
@@ -110,7 +121,7 @@ messages: List[ChatCompletionMessageParam]  = [ChatCompletionUserMessageParam(ro
 def main():
     while True:
         response = client.chat.completions.create(
-            model="gemini-3.5-flash",
+            model="gemini-3-flash-live",
             messages=messages,
             tools=tools
         )
@@ -145,7 +156,23 @@ def main():
             arguments = json.loads(tool.function.arguments)
             tool_call_id = tool.id
 
-            result = TOOL_MAPPING[fn_name](**arguments)
+            check_msg = check_rules(fn_name, arguments)
+
+            if check_msg:
+                user_res = ask_user(fn_name, arguments)
+                if not user_res:
+                    messages.append(ChatCompletionToolMessageParam(role="tool",content=f"Tool '{fn_name}' execution denied by user.",tool_call_id=tool_call_id))
+                    print(f"[tool] {fn_name}({arguments}) -> Execution denied by user.")
+                    continue
+            
+            handler = TOOL_MAPPING.get(fn_name)
+
+            if not handler:
+                messages.append(ChatCompletionToolMessageParam(role="tool",content=f"Tool '{fn_name}' not found.",tool_call_id=tool_call_id))
+                print(f"[tool] {fn_name}({arguments}) -> Tool not found.")
+                continue
+
+            result = handler(**arguments)
             messages.append(ChatCompletionToolMessageParam(role="tool",content=result,tool_call_id=tool_call_id))
             print(f"[tool] {fn_name}({arguments}) -> {result}")
 
