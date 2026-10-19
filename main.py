@@ -1,119 +1,11 @@
 from pathlib import Path
-
-from openai import OpenAI
-from dotenv import load_dotenv
-import os
-import subprocess
 import json
-from openai.types.chat import ChatCompletionUserMessageParam, ChatCompletionFunctionToolParam, ChatCompletionMessageFunctionToolCall, ChatCompletionAssistantMessageParam, ChatCompletionMessageParam,ChatCompletionToolMessageParam
-from openai.types.chat import ChatCompletionMessageToolCallUnion, ChatCompletionMessageFunctionToolCall, ChatCompletionMessageToolCallUnionParam, ChatCompletionMessageCustomToolCall
-from openai.types.shared_params.function_definition import FunctionDefinition
-from typing import List, cast, Dict
-from pydantic import BaseModel
-
-load_dotenv()
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-client = OpenAI(
-    api_key=GEMINI_API_KEY,
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-    timeout=60.0,
-    max_retries=1,
-)
-
-WORKDIR = Path(subprocess.run("pwd",shell=True,capture_output=True,text=True).stdout.strip())
-
-PERMISSION_RULES = [
-    {
-        "tools": ["run_bash_command", "read_file"],
-        "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
-        "message": "Writing outside workspace",
-    },
-    {
-        "tools": ["run_bash_command"],
-        "check": lambda args: any(kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]),
-        "message": "Potentially destructive command",
-    },
-]
-
-def check_rules(tool_name: str, args: dict) -> str | None:
-    for rule in PERMISSION_RULES:
-        if tool_name in rule["tools"] and rule["check"](args):
-            return rule["message"]
-    return None
-
-def ask_user(tool_name: str, args: dict) -> bool:
-    user_res = input(f"Tool '{tool_name}' is requesting to run with arguments {args}. Do you allow this? (y/n): ")
-    return user_res.lower() == "y"
-
-class ToolModel(BaseModel):
-    name: str
-    description: str
-    parameters: Dict[str,object]
-
-def run_bash_command(cmd: str) -> str:
-    """
-    Executes the bash command and returns stdout, stderr, return code
-    """
-    result = subprocess.run(cmd,shell=True,capture_output=True,text=True)
-    parsed_result = {
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-        "return_code": result.returncode
-    }
-    return json.dumps(parsed_result)
-    
-def read_file(path: str) -> str:
-    """
-    Reads the file and returns the content of the file
-    """
-    result = subprocess.run(f"cat {path}",shell=True,capture_output=True,text=True)
-    parsed_result = {
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "return_code": result.returncode
-    }
-    return json.dumps(parsed_result)
-
-TOOL_DEFNS: List[ToolModel] = [
-    ToolModel(name="run_bash_command",description="Executes a bash command and returns stdout, stderr, and the return code.",parameters={
-                "type": "object",
-                "properties": {
-                    "cmd": {
-                        "type": "string",
-                        "description": "The bash command to execute.",
-                    }
-                },
-                "required": ["cmd"],
-    }),
-    ToolModel(name="read_file",description="Reads a file and returns its contents.",parameters={
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "The path of the file to read.",
-                    }
-                },
-                "required": ["path"],
-    })]
-
-TOOL_MAPPING = {
-    "run_bash_command": run_bash_command,
-    "read_file": read_file
-}
-
-tools: List[ChatCompletionFunctionToolParam] = [
-    ChatCompletionFunctionToolParam(
-        type="function",
-        function=FunctionDefinition(
-            name=tool_defn.name,
-            description=tool_defn.description,
-            parameters=tool_defn.parameters,
-        ),
-    )
-    for tool_defn in TOOL_DEFNS
-]
+from openai.types.chat import ChatCompletionUserMessageParam, ChatCompletionMessageFunctionToolCall, ChatCompletionAssistantMessageParam, ChatCompletionMessageParam,ChatCompletionToolMessageParam
+from openai.types.chat import ChatCompletionMessageToolCallUnion, ChatCompletionMessageFunctionToolCall, ChatCompletionMessageToolCallUnionParam
+from typing import List, cast
+from services.client import client
+from services.tools import TOOL_MAPPING, tools
+from services.permission import check_rules, ask_user
 
 query = input("user query: ")
 messages: List[ChatCompletionMessageParam]  = [ChatCompletionUserMessageParam(role="user",content=query)]
@@ -121,7 +13,7 @@ messages: List[ChatCompletionMessageParam]  = [ChatCompletionUserMessageParam(ro
 def main():
     while True:
         response = client.chat.completions.create(
-            model="gemini-3-flash-live",
+            model="gemini-2.5-flash",
             messages=messages,
             tools=tools
         )
@@ -159,7 +51,7 @@ def main():
             check_msg = check_rules(fn_name, arguments)
 
             if check_msg:
-                user_res = ask_user(fn_name, arguments)
+                user_res = ask_user(fn_name, arguments, check_msg)
                 if not user_res:
                     messages.append(ChatCompletionToolMessageParam(role="tool",content=f"Tool '{fn_name}' execution denied by user.",tool_call_id=tool_call_id))
                     print(f"[tool] {fn_name}({arguments}) -> Execution denied by user.")
