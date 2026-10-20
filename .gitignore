@@ -9,7 +9,12 @@ wheels/
 # Virtual environments
 .venv
 
+# Generated logs
+logs/
+
 # Secrets
 .env
 .env.*
 !.env.example
+
+trace.html

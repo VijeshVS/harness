@@ -58,18 +58,30 @@ def spawn_subagent(agent_name: str, query: str) -> str:
     )
 
     assert proc.stdout is not None
-    summary = None
+    prefix = f"[{agent_name}] "
+    last_llm = None
+    llm_lines = None
 
     for line in proc.stdout:
         print(line, end="", flush=True)
 
-        if line.startswith("[summary]"):
-            summary = line.removeprefix("[summary]").strip()
+        clean = line.removeprefix(prefix)
+        if clean.startswith("[llm]"):
+            llm_lines = [clean.removeprefix("[llm]")]
+        elif llm_lines is not None:
+            if clean.startswith("[SYSTEM]"):
+                last_llm = "".join(llm_lines).strip()
+                llm_lines = None
+            else:
+                llm_lines.append(line)
+
+    if llm_lines is not None:
+        last_llm = "".join(llm_lines).strip()
 
     proc.wait()
 
-    if summary:
-        return f"Subagent {agent_name} result: {summary}"
+    if last_llm:
+        return f"Subagent {agent_name} result: {last_llm}"
 
     return f"Subagent {agent_name} executed {query}"
 

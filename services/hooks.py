@@ -27,10 +27,11 @@ def trigger_hooks(event_name: str, *args, **kwargs):
 def execution_summary(messages: List[ChatCompletionMessageParam]):
     messages.append(ChatCompletionUserMessageParam(role="user", content="Give me summary of conversation we had so far in one line"))
     response = client.chat.completions.create(
-        model="gpt-5-nano",
+        model="gpt-5.6-luna",   
         messages=messages,
         prompt_cache_key=get_session_id(),
         prompt_cache_options={"mode": "implicit"},
+        reasoning_effort="none",
     )
     print(f"[summary] {response.choices[0].message.content}")
 
