@@ -8,6 +8,7 @@ from services.permission import check_rules, ask_user
 from services.hooks import trigger_hooks, get_session_id
 from services.args import parse_args
 from services.logger import enable_trace
+from services.skills import SYSTEM_SKILLS
 import builtins
 
 args = parse_args()
@@ -27,7 +28,7 @@ session_id = get_session_id()
 if not query:
     query = input("User Query: ")
 
-SYSTEM_PROMPT = Path("prompts/system_prompt.txt").read_text()
+SYSTEM_PROMPT = Path("prompts/system_prompt.txt").read_text() + "\n\n" + SYSTEM_SKILLS
 messages: List[ChatCompletionMessageParam]  = [ChatCompletionSystemMessageParam(role="system",content=SYSTEM_PROMPT),
                                                ChatCompletionUserMessageParam(role="user",content=query)]
 
