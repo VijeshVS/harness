@@ -8,6 +8,7 @@ from services.tools import TOOL_MAPPING, tools
 from services.permission import check_rules, ask_user
 from services.hooks import trigger_hooks
 
+trigger_hooks("Start")
 query = input("User Query: ")
 messages: List[ChatCompletionMessageParam]  = [ChatCompletionUserMessageParam(role="user",content=query)]
 
@@ -38,6 +39,8 @@ def main():
         )
 
         for tool in tool_calls:
+            trigger_hooks("PreToolCall", messages=messages, tool=tool)
+            
             if not isinstance(tool, ChatCompletionMessageFunctionToolCall):
                 continue
 
@@ -63,6 +66,8 @@ def main():
 
             result = handler(**arguments)
             messages.append(ChatCompletionToolMessageParam(role="tool",content=result,tool_call_id=tool_call_id))
+
+            trigger_hooks("PostToolCall", messages=messages, tool=tool, result=result)
             print(f"[tool] {fn_name}({arguments}) -> {result}")
 
 if __name__ == "__main__":

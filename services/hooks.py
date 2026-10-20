@@ -1,9 +1,10 @@
+import os
 from openai.types.chat import ChatCompletionUserMessageParam, ChatCompletionMessageParam 
 from services.client import client
 from typing import List
 
 hooks = {
-    "PreUserInput": [],
+    "Start": [],
     "PostUserInput": [],
     "PreToolCall": [],
     "PostToolCall": [],
@@ -32,3 +33,9 @@ def execution_summary(messages: List[ChatCompletionMessageParam]):
     print(f"[summary] {response.choices[0].message.content}")
 
 register_hook("Stop", execution_summary)
+
+def start_session():
+    session_id = os.urandom(8).hex()
+    print(f"[session] Session started with ID: {session_id}")
+
+register_hook("Start", start_session)
