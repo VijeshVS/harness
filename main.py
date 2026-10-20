@@ -5,12 +5,28 @@ from typing import List, cast
 from services.client import client
 from services.tools import TOOL_MAPPING, tools
 from services.permission import check_rules, ask_user
-from services.hooks import trigger_hooks
+from services.hooks import trigger_hooks, get_session_id
+import argparse 
+import builtins
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--query", type=str, required = False)
+parser.add_argument("--agent", type=str, required = False)
+args = parser.parse_args()
+query = args.query
+agent = args.agent
+
+if agent:
+    def print(*args, **kwargs):
+        builtins.print(f"[{agent}]", *args, **kwargs)
 
 trigger_hooks("Start")
+session_id = get_session_id()
+
+if not query:
+    query = input("User Query: ")
 
 SYSTEM_PROMPT = Path("prompts/system_prompt.txt").read_text()
-query = input("User Query: ")
 messages: List[ChatCompletionMessageParam]  = [ChatCompletionSystemMessageParam(role="system",content=SYSTEM_PROMPT),
                                                ChatCompletionUserMessageParam(role="user",content=query)]
 
@@ -19,7 +35,9 @@ def main():
         response = client.chat.completions.create(
             model="gpt-5-nano",
             messages=messages,
-            tools=tools
+            tools=tools,
+            prompt_cache_key=session_id,
+            prompt_cache_options={"mode": "implicit"}
         )
         
         reason = response.choices[0].finish_reason
