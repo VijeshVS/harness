@@ -1,0 +1,34 @@
+from openai.types.chat import ChatCompletionUserMessageParam, ChatCompletionMessageParam 
+from services.client import client
+from typing import List
+
+hooks = {
+    "PreUserInput": [],
+    "PostUserInput": [],
+    "PreToolCall": [],
+    "PostToolCall": [],
+    "Stop": [],
+}
+
+def register_hook(event_name: str, callback):
+    if event_name in hooks:
+        hooks[event_name].append(callback)
+    else:
+        raise ValueError(f"Unknown event name: {event_name}")
+
+def trigger_hooks(event_name: str, *args, **kwargs):
+    if event_name in hooks:
+        for callback in hooks[event_name]:
+            callback(*args, **kwargs)
+    else:
+        raise ValueError(f"Unknown event name: {event_name}")
+
+def execution_summary(messages: List[ChatCompletionMessageParam]):
+    messages.append(ChatCompletionUserMessageParam(role="user", content="Give me summary of conversation we had so far in one line"))
+    response = client.chat.completions.create(
+        model="gemini-2.5-flash",
+        messages=messages,
+    )
+    print(f"[summary] {response.choices[0].message.content}")
+
+register_hook("Stop", execution_summary)
