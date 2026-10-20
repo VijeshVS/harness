@@ -3,7 +3,7 @@ import json
 from openai.types.chat import ChatCompletionFunctionToolParam
 from openai.types.shared_params.function_definition import FunctionDefinition
 from schema.client import ToolModel
-from services.skills import load_skill
+from services.skills import SKILL_REGISTRY
 from typing import List
 
 CURRENT_TODOS: list[dict] = []
@@ -85,6 +85,13 @@ def spawn_subagent(agent_name: str, query: str) -> str:
         return f"Subagent {agent_name} result: {last_llm}"
 
     return f"Subagent {agent_name} executed {query}"
+
+def load_skill(name: str) -> str:
+    skill = SKILL_REGISTRY.get(name)
+    if not skill:
+        available = ", ".join(SKILL_REGISTRY) or "none"
+        return f"Skill '{name}' not found. Available skills: {available}"
+    return skill["content"]
 
 TOOL_DEFNS: List[ToolModel] = [
     ToolModel(name="run_bash_command",description="Executes a bash command and returns stdout, stderr, and the return code.",parameters={
