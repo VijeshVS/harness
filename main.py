@@ -1,7 +1,6 @@
 from pathlib import Path
 import json
-from openai.types.chat import ChatCompletionUserMessageParam, ChatCompletionMessageFunctionToolCall, ChatCompletionAssistantMessageParam, ChatCompletionMessageParam,ChatCompletionToolMessageParam
-from openai.types.chat import ChatCompletionMessageToolCallUnion, ChatCompletionMessageFunctionToolCall, ChatCompletionMessageToolCallUnionParam
+from openai.types.chat import ChatCompletionUserMessageParam,ChatCompletionMessageFunctionToolCall, ChatCompletionAssistantMessageParam, ChatCompletionMessageParam,ChatCompletionToolMessageParam, ChatCompletionSystemMessageParam,ChatCompletionMessageToolCallUnion, ChatCompletionMessageFunctionToolCall, ChatCompletionMessageToolCallUnionParam
 from typing import List, cast
 from services.client import client
 from services.tools import TOOL_MAPPING, tools
@@ -9,13 +8,16 @@ from services.permission import check_rules, ask_user
 from services.hooks import trigger_hooks
 
 trigger_hooks("Start")
+
+SYSTEM_PROMPT = Path("prompts/system_prompt.txt").read_text()
 query = input("User Query: ")
-messages: List[ChatCompletionMessageParam]  = [ChatCompletionUserMessageParam(role="user",content=query)]
+messages: List[ChatCompletionMessageParam]  = [ChatCompletionSystemMessageParam(role="system",content=SYSTEM_PROMPT),
+                                               ChatCompletionUserMessageParam(role="user",content=query)]
 
 def main():
     while True:
         response = client.chat.completions.create(
-            model="gemini-2.5-flash",
+            model="gpt-5-nano",
             messages=messages,
             tools=tools
         )
