@@ -6,15 +6,16 @@ from services.client import client
 from services.tools import TOOL_MAPPING, tools
 from services.permission import check_rules, ask_user
 from services.hooks import trigger_hooks, get_session_id
-import argparse 
+from services.args import parse_args
+from services.logger import enable_trace
 import builtins
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--query", type=str, required = False)
-parser.add_argument("--agent", type=str, required = False)
-args = parser.parse_args()
+args = parse_args()
 query = args.query
 agent = args.agent
+
+if args.trace.lower() == "true":
+    enable_trace()
 
 if agent:
     def print(*args, **kwargs):
@@ -33,11 +34,12 @@ messages: List[ChatCompletionMessageParam]  = [ChatCompletionSystemMessageParam(
 def main():
     while True:
         response = client.chat.completions.create(
-            model="gpt-5-nano",
+            model="gpt-5.6-luna",
             messages=messages,
             tools=tools,
             prompt_cache_key=session_id,
-            prompt_cache_options={"mode": "implicit"}
+            prompt_cache_options={"mode": "implicit"},
+            reasoning_effort="none",
         )
         
         reason = response.choices[0].finish_reason
