@@ -46,10 +46,3 @@ def build_system() -> str:
     )
 
 SYSTEM_SKILLS = build_system()
-
-def load_skill(name: str) -> str:
-    skill = SKILL_REGISTRY.get(name)
-    if not skill:
-        available = ", ".join(SKILL_REGISTRY) or "none"
-        return f"Skill '{name}' not found. Available skills: {available}"
-    return skill["content"]

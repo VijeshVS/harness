@@ -8,7 +8,7 @@ from services.permission import check_rules, ask_user
 from services.hooks import trigger_hooks, get_session_id
 from services.args import parse_args
 from services.logger import enable_trace
-from services.skills import SYSTEM_SKILLS
+from services.prompt import assemble_system_prompt
 import builtins
 
 args = parse_args()
@@ -28,7 +28,7 @@ session_id = get_session_id()
 if not query:
     query = input("User Query: ")
 
-SYSTEM_PROMPT = Path("prompts/system_prompt.txt").read_text() + "\n\n" + SYSTEM_SKILLS
+SYSTEM_PROMPT = assemble_system_prompt()
 messages: List[ChatCompletionMessageParam]  = [ChatCompletionSystemMessageParam(role="system",content=SYSTEM_PROMPT),
                                                ChatCompletionUserMessageParam(role="user",content=query)]
 
@@ -87,7 +87,14 @@ def main():
                 print(f"[tool] {fn_name}({arguments}) -> Tool not found.")
                 continue
 
-            result = handler(**arguments)
+            try:
+                result = handler(**arguments)
+            except Exception as e:
+                result = f"Tool '{fn_name}' execution failed with error: {str(e)}"
+                messages.append(ChatCompletionToolMessageParam(role="tool",content=result,tool_call_id=tool_call_id))
+                print(f"[tool] {fn_name}({arguments}) -> Execution failed with error: {str(e)}")
+                continue
+            
             messages.append(ChatCompletionToolMessageParam(role="tool",content=result,tool_call_id=tool_call_id))
 
             trigger_hooks("PostToolCall", messages=messages, tool=tool, result=result)
