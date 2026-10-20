@@ -6,7 +6,8 @@ WORKDIR = Path.cwd()
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
     "workspace": f"Working directory: {WORKDIR}",
-    "custom_instructions": ["Before starting, create an actionable task plan and keep it updated as work progresses, ensuring statuses accurately reflect actual progress."],
+    "custom_instructions": ["Before starting, create an actionable task plan and keep it updated as work progresses, ensuring statuses accurately reflect actual progress.",
+                            "When calling a tool, pass only the arguments specified in the tool call. Never add, modify, or invent extra arguments yourself.",],
 }
 
 def assemble_system_prompt() -> str:
