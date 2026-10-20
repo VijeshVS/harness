@@ -3,6 +3,7 @@ import json
 from openai.types.chat import ChatCompletionFunctionToolParam
 from openai.types.shared_params.function_definition import FunctionDefinition
 from schema.client import ToolModel
+from services.skills import load_skill
 from typing import List
 
 CURRENT_TODOS: list[dict] = []
@@ -38,11 +39,11 @@ def run_todo_write(todos: list) -> str:
     global CURRENT_TODOS
     CURRENT_TODOS = todos
 
-    lines = ["[todos] Current Todos:\n"]
+    lines = ["[todos] Current Todos:"]
     for t in CURRENT_TODOS:
         icon = {"pending": "⧗", "in_progress": "▸", "completed": "✓"}[t["status"]]
-        lines.append(f"{icon} {t['title']}\n")
-    print("".join(lines))
+        lines.append(f"{icon} {t['title']}")
+    print("\n".join(lines))
 
     return f"Updated {len(CURRENT_TODOS)} todos."
 
@@ -143,6 +144,16 @@ TOOL_DEFNS: List[ToolModel] = [
                     }
                 },
                 "required": ["agent_name", "query"],
+    }),
+    ToolModel(name="load_skill",description="Loads the full instructions for a skill by name.",parameters={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The name of the skill to load.",
+                    }
+                },
+                "required": ["name"],
     })
     ]
 
@@ -151,7 +162,8 @@ TOOL_MAPPING = {
     "run_bash_command": run_bash_command,
     "read_file": read_file,
     "spawn_subagent": spawn_subagent,
-    "run_todo_write": run_todo_write
+    "run_todo_write": run_todo_write,
+    "load_skill": load_skill
 }
     
 tools: List[ChatCompletionFunctionToolParam] = [
