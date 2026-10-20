@@ -29,6 +29,8 @@ def execution_summary(messages: List[ChatCompletionMessageParam]):
     response = client.chat.completions.create(
         model="gpt-5-nano",
         messages=messages,
+        prompt_cache_key=get_session_id(),
+        prompt_cache_options={"mode": "implicit"},
     )
     print(f"[summary] {response.choices[0].message.content}")
 
