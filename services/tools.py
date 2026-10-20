@@ -46,6 +46,33 @@ def run_todo_write(todos: list) -> str:
 
     return f"Updated {len(CURRENT_TODOS)} todos."
 
+def spawn_subagent(agent_name: str, query: str) -> str:
+    """Spawns a sub-agent with the given name and query."""
+
+    proc = subprocess.Popen(
+        ["uv", "run", "main.py", "--query", query, "--agent", agent_name],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    assert proc.stdout is not None
+    summary = None
+
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+
+        if line.startswith("[summary]"):
+            summary = line.removeprefix("[summary]").strip()
+
+    proc.wait()
+
+    if summary:
+        return f"Subagent {agent_name} result: {summary}"
+
+    return f"Subagent {agent_name} executed {query}"
+
 TOOL_DEFNS: List[ToolModel] = [
     ToolModel(name="run_bash_command",description="Executes a bash command and returns stdout, stderr, and the return code.",parameters={
                 "type": "object",
@@ -90,11 +117,28 @@ TOOL_DEFNS: List[ToolModel] = [
                     }
                 },
                 "required": ["todos"],
-    })]
+    }),
+    ToolModel(name="spawn_subagent",description="Spawns a sub-agent with the given name and query.",parameters={
+                "type": "object",
+                "properties": {
+                    "agent_name": {
+                        "type": "string",
+                        "description": "The name of the sub-agent to spawn.",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "The query to pass to the sub-agent.",
+                    }
+                },
+                "required": ["agent_name", "query"],
+    })
+    ]
+
 
 TOOL_MAPPING = {
     "run_bash_command": run_bash_command,
     "read_file": read_file,
+    "spawn_subagent": spawn_subagent,
     "run_todo_write": run_todo_write
 }
     

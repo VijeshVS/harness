@@ -34,8 +34,16 @@ def execution_summary(messages: List[ChatCompletionMessageParam]):
 
 register_hook("Stop", execution_summary)
 
+_session_id: str | None = None
+
 def start_session():
-    session_id = os.urandom(8).hex()
-    print(f"[session] Session started with ID: {session_id}")
+    global _session_id
+    _session_id = os.urandom(8).hex()
+    print(f"[session] Session started with ID: {_session_id}")
+
+def get_session_id() -> str:
+    if _session_id is None:
+        raise RuntimeError("Session not started")
+    return _session_id
 
 register_hook("Start", start_session)
