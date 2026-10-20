@@ -6,8 +6,9 @@ from typing import List, cast
 from services.client import client
 from services.tools import TOOL_MAPPING, tools
 from services.permission import check_rules, ask_user
+from services.hooks import trigger_hooks
 
-query = input("user query: ")
+query = input("User Query: ")
 messages: List[ChatCompletionMessageParam]  = [ChatCompletionUserMessageParam(role="user",content=query)]
 
 def main():
@@ -23,14 +24,10 @@ def main():
         if reason != "tool_calls" or response.choices[0].message.tool_calls == None:
             print(f"[llm] {response.choices[0].message.content}")
             print("[SYSTEM] llm execution finished successfully !!")
+            trigger_hooks("Stop", messages=messages)
             return
 
         tool_calls: List[ChatCompletionMessageToolCallUnion] = response.choices[0].message.tool_calls
-
-        if not tool_calls:
-            print(f"[llm] {response.choices[0].message.content}")
-            print("[SYSTEM] llm execution finished successfully !!")
-            return
 
         messages.append(
             ChatCompletionAssistantMessageParam(
