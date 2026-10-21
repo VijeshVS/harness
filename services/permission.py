@@ -5,13 +5,13 @@ WORKDIR = Path(subprocess.run("pwd",shell=True,capture_output=True,text=True).st
 
 PERMISSION_RULES = [
     {
-        "tools": ["run_bash_command", "read_file"],
+        "tools": ["run_bash_command", "read_file", "write_file"],
         "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
         "message": "Writing outside workspace",
     },
     {
         "tools": ["run_bash_command"],
-        "check": lambda args: any(kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]),
+        "check": lambda args: any(kw in args.get("cmd", "") for kw in ["rm ", "> /etc/", "chmod 777"]),
         "message": "Potentially destructive command",
     },
 ]

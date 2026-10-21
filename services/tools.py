@@ -1,5 +1,8 @@
 import subprocess
 import json
+import os
+import re
+from pathlib import Path
 from openai.types.chat import ChatCompletionFunctionToolParam
 from openai.types.shared_params.function_definition import FunctionDefinition
 from schema.client import ToolModel
@@ -20,17 +23,93 @@ def run_bash_command(cmd: str) -> str:
     }
     return json.dumps(parsed_result)
     
-def read_file(path: str) -> str:
+def read_file(path: str, offset: int = 0, limit: int | None = None) -> str:
     """
-    Reads the file and returns the content of the file
+    Reads the file and returns the requested lines
     """
-    result = subprocess.run(f"cat {path}",shell=True,capture_output=True,text=True)
-    parsed_result = {
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "return_code": result.returncode
-    }
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+        selected = lines[offset:] if limit is None else lines[offset:offset + limit]
+        parsed_result = {
+                "stdout": "".join(selected),
+                "stderr": "",
+                "return_code": 0
+        }
+    except OSError as e:
+        parsed_result = {
+                "stdout": "",
+                "stderr": str(e),
+                "return_code": 1
+        }
     return json.dumps(parsed_result)
+
+def write_file(path: str, content: str, offset: int = 0, limit: int | None = None) -> str:
+    """
+    Writes content, replacing `limit` lines from `offset` (or to EOF when limit is None)
+    """
+    p = Path(path)
+    existing = p.read_text(encoding="utf-8").splitlines(keepends=True) if p.exists() else []
+    new_lines = content.splitlines(keepends=True)
+    if new_lines and not new_lines[-1].endswith("\n"):
+        new_lines[-1] += "\n"
+    end = len(existing) if limit is None else offset + limit
+    updated = existing[:offset] + new_lines + existing[end:]
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("".join(updated), encoding="utf-8")
+    return f"Wrote {len(new_lines)} lines to {path} at line {offset}."
+
+def search_files(pattern: str, path: str = ".") -> str:
+    """
+    Searches for file paths matching the given regex pattern
+    """
+    try:
+        regex = re.compile(pattern, re.IGNORECASE)
+    except re.error as e:
+        return json.dumps({"error": f"Invalid regex: {e}", "matches": []})
+
+    skip_dirs = {".git", ".venv", "__pycache__", "node_modules", "logs"}
+    matches = []
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for name in files:
+            full_path = os.path.join(root, name)
+            rel_path = os.path.relpath(full_path, path)
+            if regex.search(rel_path):
+                matches.append(rel_path)
+
+    matches.sort()
+    return json.dumps({"matches": matches, "count": len(matches)})
+
+def search_code(pattern: str, path: str = ".") -> str:
+    """
+    Searches file contents for the given regex and returns matching files with line offsets
+    """
+    try:
+        regex = re.compile(pattern)
+    except re.error as e:
+        return json.dumps({"error": f"Invalid regex: {e}", "matches": []})
+
+    skip_dirs = {".git", ".venv", "__pycache__", "node_modules", "logs"}
+    matches = []
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for name in files:
+            full_path = os.path.join(root, name)
+            rel_path = os.path.relpath(full_path, path)
+            try:
+                with open(full_path, encoding="utf-8") as f:
+                    for offset, line in enumerate(f, start=1):
+                        if regex.search(line):
+                            matches.append({
+                                "file": rel_path,
+                                "offset": offset,
+                                "line": line.rstrip("\n"),
+                            })
+            except (OSError, UnicodeDecodeError):
+                continue
+
+    return json.dumps({"matches": matches, "count": len(matches)})
 
 def run_todo_write(todos: list) -> str:
     """
@@ -104,15 +183,73 @@ TOOL_DEFNS: List[ToolModel] = [
                 },
                 "required": ["cmd"],
     }),
-    ToolModel(name="read_file",description="Reads a file and returns its contents.",parameters={
+    ToolModel(name="read_file",description="Reads a file and returns its contents, optionally a slice of lines.",parameters={
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": "The path of the file to read.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Zero-based line offset to start reading from. Defaults to 0.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of lines to read. Defaults to all remaining lines.",
                     }
                 },
                 "required": ["path"],
+    }),
+    ToolModel(name="write_file",description="Writes content to a file, optionally replacing a range of lines.",parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The path of the file to write.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The content to write.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Zero-based line offset to start writing at. Defaults to 0.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of existing lines to replace. Defaults to all lines from offset to EOF.",
+                    }
+                },
+                "required": ["path", "content"],
+    }),
+    ToolModel(name="search_files",description="Recursively searches for files whose relative path matches the given regex pattern.",parameters={
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regex pattern to match against file paths, e.g. 'tools\\.py' or '\\.md$'.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to search in. Defaults to the current directory.",
+                    }
+                },
+                "required": ["pattern"],
+    }),
+    ToolModel(name="search_code",description="Searches file contents for a regex pattern and returns matching files with the line offset and line text.",parameters={
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regex pattern to search for in file contents, e.g. 'def read_file' or 'TOOL_MAPPING'.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to search in. Defaults to the current directory.",
+                    }
+                },
+                "required": ["pattern"],
     }),
     ToolModel(name="run_todo_write",description="Writes the todos to the CURRENT_TODOS list.",parameters={
                 "type": "object",
@@ -168,6 +305,9 @@ TOOL_DEFNS: List[ToolModel] = [
 TOOL_MAPPING = {
     "run_bash_command": run_bash_command,
     "read_file": read_file,
+    "write_file": write_file,
+    "search_files": search_files,
+    "search_code": search_code,
     "spawn_subagent": spawn_subagent,
     "run_todo_write": run_todo_write,
     "load_skill": load_skill
