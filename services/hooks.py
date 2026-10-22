@@ -19,6 +19,15 @@ def register_hook(event_name: str, callback):
     else:
         raise ValueError(f"Unknown event name: {event_name}")
 
+def unregister_hook(event_name: str, callback):
+    if event_name in hooks:
+        try:
+            hooks[event_name].remove(callback)
+        except ValueError:
+            pass
+    else:
+        raise ValueError(f"Unknown event name: {event_name}")
+
 def trigger_hooks(event_name: str, *args, **kwargs):
     if event_name in hooks:
         for callback in hooks[event_name]:

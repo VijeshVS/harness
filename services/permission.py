@@ -1,7 +1,22 @@
 import subprocess
 from pathlib import Path
+from typing import Callable
 
 WORKDIR = Path(subprocess.run("pwd",shell=True,capture_output=True,text=True).stdout.strip())
+
+PromptHandler = Callable[[str, dict, str], bool]
+
+_prompt_handler: PromptHandler | None = None
+
+
+def set_prompt_handler(handler: PromptHandler) -> None:
+    global _prompt_handler
+    _prompt_handler = handler
+
+
+def clear_prompt_handler() -> None:
+    global _prompt_handler
+    _prompt_handler = None
 
 PERMISSION_RULES = [
     {
@@ -23,5 +38,8 @@ def check_rules(tool_name: str, args: dict) -> str | None:
     return None
 
 def ask_user(tool_name: str, args: dict, reason: str) -> bool:
+    if _prompt_handler is not None:
+        return bool(_prompt_handler(tool_name, args, reason))
+
     user_res = input(f"Tool '{tool_name}' is requesting to run with arguments {args}. Reason: {reason}. Do you allow this? (y/n): ")
     return user_res.lower() == "y"
