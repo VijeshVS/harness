@@ -8,24 +8,20 @@ from openai.types.chat import (
     ChatCompletionMessageToolCallUnion,
     ChatCompletionMessageToolCallUnionParam,
 )
+from config import settings
+from core.compact import compact_messages
 from core.llm import create_completion
 from core.tool import execute_tool_calls
 from core.user_input import get_user_query
 from services.tools import tools
-from services.hooks import trigger_hooks, get_session_id
+from services.hooks import trigger_hooks
 from services.args import parse_args
-from services.logger import enable_trace
 from services.prompt import assemble_system_prompt
 
-MAX_COMPLETION_TOKENS = [64, 1024, 2048, 4096, 8192, 16384, 32768]
-TOKEN_INDEX = 0
+MAX_COMPLETION_TOKENS = settings.llm.max_completion_tokens
 
 args = parse_args()
-query = args.query
 agent = args.agent
-
-if args.trace.lower() == "true":
-    enable_trace()
 
 if agent:
     def print(*args, **kwargs):
@@ -33,50 +29,104 @@ if agent:
 
 trigger_hooks("Start")
 
-session_id = get_session_id()
-query = get_user_query(query)
-
 SYSTEM_PROMPT = assemble_system_prompt()
 
-messages: List[ChatCompletionMessageParam] = [
-    ChatCompletionSystemMessageParam(role="system", content=SYSTEM_PROMPT),
-    ChatCompletionUserMessageParam(role="user", content=query),
-]
 
+def run_turn(messages: List[ChatCompletionMessageParam]) -> None:
+    token_index = settings.llm.starting_token_index
 
-def main():
-    global TOKEN_INDEX
-    global MAX_COMPLETION_TOKENS
-    
     while True:
-        response = create_completion(messages, tools,max_tokens=MAX_COMPLETION_TOKENS[TOKEN_INDEX])
-        reason = response.choices[0].finish_reason
+        response = create_completion(
+            messages, tools, max_tokens=MAX_COMPLETION_TOKENS[token_index]
+        )
+        choice = response.choices[0]
+        reason = choice.finish_reason
+        tool_calls: List[ChatCompletionMessageToolCallUnion] | None = (
+            choice.message.tool_calls
+        )
 
-        if reason != "tool_calls" or response.choices[0].message.tool_calls == None:
+        if reason != "tool_calls" or tool_calls is None:
+            if reason == "length" and token_index < len(MAX_COMPLETION_TOKENS) - 1:
+                token_index += 1
+                print(
+                    "[llm] Completion length exceeded. "
+                    f"Increasing max tokens to {MAX_COMPLETION_TOKENS[token_index]} and retrying..."
+                )
+                continue
             if reason == "length":
-                TOKEN_INDEX = min(TOKEN_INDEX + 1, len(MAX_COMPLETION_TOKENS) - 1)
-                if TOKEN_INDEX < len(MAX_COMPLETION_TOKENS):
-                    print(f"[llm] Completion length exceeded. Increasing max tokens to {MAX_COMPLETION_TOKENS[TOKEN_INDEX]} and retrying...")
-                    continue
-                else:
-                    print("[llm] Completion length exceeded. Maximum token limit reached. Cannot increase further.")
-            print(f"[stop-reason] {reason}")
-            print(f"[llm] {response.choices[0].message.content}")
-            print("[system] llm execution finished successfully !!")
-            trigger_hooks("Stop", messages=messages)
-            return
+                print(
+                    "[llm] Completion length exceeded. "
+                    "Maximum token limit reached. Cannot increase further."
+                )
 
-        tool_calls: List[ChatCompletionMessageToolCallUnion] = response.choices[0].message.tool_calls
+            content = choice.message.content
+            if content:
+                messages.append(
+                    ChatCompletionAssistantMessageParam(
+                        role="assistant", content=content
+                    )
+                )
+            print(f"[stop-reason] {reason}")
+            print(f"[llm] {content}")
+            return
 
         messages.append(
             ChatCompletionAssistantMessageParam(
                 role="assistant",
-                content=response.choices[0].message.content,
+                content=choice.message.content,
                 tool_calls=cast(List[ChatCompletionMessageToolCallUnionParam], tool_calls),
             )
         )
 
         execute_tool_calls(tool_calls, messages)
+
+
+def main() -> None:
+    messages: List[ChatCompletionMessageParam] = [
+        ChatCompletionSystemMessageParam(role="system", content=SYSTEM_PROMPT)
+    ]
+
+    try:
+        if agent:
+            if not args.query:
+                raise ValueError("Subagent mode requires a non-empty --query")
+            messages.append(
+                ChatCompletionUserMessageParam(role="user", content=args.query)
+            )
+            run_turn(messages)
+        else:
+            first_query = args.query
+            while True:
+                query = get_user_query(first_query, allow_exit=True)
+                first_query = None
+                if query is None:
+                    break
+
+                command = query.strip().lower()
+                if command.startswith("/"):
+                    if command == "/compact":
+                        messages[:] = compact_messages(messages)
+                    else:
+                        print(f"[command] invalid operation: {query.strip()}")
+                    continue
+
+                snapshot = list(messages)
+                messages.append(
+                    ChatCompletionUserMessageParam(role="user", content=query)
+                )
+                try:
+                    run_turn(messages)
+                except Exception as error:
+                    print(f"[llm] turn failed: {error}")
+                    messages[:] = snapshot
+    except KeyboardInterrupt:
+        print("\n[system] Interrupted. Exiting...")
+        return
+
+    try:
+        trigger_hooks("Stop", messages=list(messages))
+    except KeyboardInterrupt:
+        print("\n[system] Interrupted. Exiting...")
 
 
 if __name__ == "__main__":

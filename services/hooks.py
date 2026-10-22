@@ -1,6 +1,8 @@
 import os
 from openai.types.chat import ChatCompletionUserMessageParam, ChatCompletionMessageParam 
 from services.client import client
+from config import settings
+from core.compact import compact_messages, needs_compaction
 from typing import List
 
 hooks = {
@@ -25,10 +27,13 @@ def trigger_hooks(event_name: str, *args, **kwargs):
         raise ValueError(f"Unknown event name: {event_name}")
 
 def execution_summary(messages: List[ChatCompletionMessageParam]):
-    messages.append(ChatCompletionUserMessageParam(role="user", content="Give me summary of conversation we had so far in one line"))
+    summary_messages = list(messages)
+    if needs_compaction(summary_messages):
+        summary_messages = compact_messages(summary_messages)
+    summary_messages.append(ChatCompletionUserMessageParam(role="user", content="Give me summary of conversation we had so far in one line"))
     response = client.chat.completions.create(
-        model="gpt-5.6-luna",   
-        messages=messages,
+        model=settings.llm.model,
+        messages=summary_messages,
         prompt_cache_key=get_session_id(),
         prompt_cache_options={"mode": "implicit"},
         reasoning_effort="none",
