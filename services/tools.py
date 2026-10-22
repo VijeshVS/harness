@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from openai.types.chat import ChatCompletionFunctionToolParam
 from openai.types.shared_params.function_definition import FunctionDefinition
+from core.subagent import run_subagent
 from schema.client import ToolModel
 from services.skills import SKILL_REGISTRY
 from typing import List
@@ -129,41 +130,7 @@ def run_todo_write(todos: list) -> str:
 def spawn_subagent(agent_name: str, query: str) -> str:
     """Spawns a sub-agent with the given name and query."""
 
-    proc = subprocess.Popen(
-        ["uv", "run", "main.py", "--query", query, "--agent", agent_name],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-
-    assert proc.stdout is not None
-    prefix = f"[{agent_name}] "
-    last_llm = None
-    llm_lines = None
-
-    for line in proc.stdout:
-        print(line, end="", flush=True)
-
-        clean = line.removeprefix(prefix)
-        if clean.startswith("[llm]"):
-            llm_lines = [clean.removeprefix("[llm]")]
-        elif llm_lines is not None:
-            if clean.startswith("[system]"):
-                last_llm = "".join(llm_lines).strip()
-                llm_lines = None
-            else:
-                llm_lines.append(clean)
-
-    if llm_lines is not None:
-        last_llm = "".join(llm_lines).strip()
-
-    proc.wait()
-
-    if last_llm:
-        return f"Subagent {agent_name} result: {last_llm}"
-
-    return f"Subagent {agent_name} executed {query}"
+    return run_subagent(agent_name, query)
 
 def load_skill(name: str) -> str:
     skill = SKILL_REGISTRY.get(name)
