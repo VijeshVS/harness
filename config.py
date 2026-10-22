@@ -36,7 +36,7 @@ class LLMSettings:
         "LLM_MAX_COMPLETION_TOKENS",
         (64, 1024, 2048, 4096, 8192, 16384, 32768),
     )
-    starting_token_index: int = _env_int("LLM_STARTING_TOKEN_INDEX", 0)
+    starting_token_index: int = _env_int("LLM_STARTING_TOKEN_INDEX", 3)
 
     def __post_init__(self) -> None:
         if self.max_retries < 1:
