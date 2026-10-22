@@ -149,11 +149,11 @@ def spawn_subagent(agent_name: str, query: str) -> str:
         if clean.startswith("[llm]"):
             llm_lines = [clean.removeprefix("[llm]")]
         elif llm_lines is not None:
-            if clean.startswith("[SYSTEM]"):
+            if clean.startswith("[system]"):
                 last_llm = "".join(llm_lines).strip()
                 llm_lines = None
             else:
-                llm_lines.append(line)
+                llm_lines.append(clean)
 
     if llm_lines is not None:
         last_llm = "".join(llm_lines).strip()

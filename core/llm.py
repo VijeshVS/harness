@@ -1,55 +1,124 @@
+import random
 import time
 from typing import List
+
+from openai import (
+    APIConnectionError,
+    BadRequestError,
+    InternalServerError,
+    RateLimitError,
+)
 from openai.types.chat import (
     ChatCompletion,
     ChatCompletionFunctionToolParam,
     ChatCompletionMessageParam,
 )
+
+from config import settings
+from core.compact import compact_messages, needs_compaction
 from services.client import client
 from services.hooks import get_session_id
-from openai import BadRequestError, InternalServerError, RateLimitError, APIConnectionError
 
-MODEL = "gpt-5.6-luna"
+RETRYABLE_ERRORS = (InternalServerError, RateLimitError, APIConnectionError)
+
+
+class CompletionFailedError(RuntimeError):
+    pass
+
+
+def _retry_reason(error: Exception) -> str:
+    if isinstance(error, InternalServerError):
+        return "Internal server error"
+    if isinstance(error, RateLimitError):
+        return "Rate limit exceeded"
+    return "API connection error"
+
+
+def backoff_delay(attempt: int, retry_after: float | None = None) -> float:
+    if retry_after is not None:
+        return retry_after
+    ceiling = min(
+        settings.llm.max_delay,
+        settings.llm.base_delay * (2 ** attempt),
+    )
+    return random.uniform(0, ceiling)
+
+
+def _retry_after(error: Exception) -> float | None:
+    headers = getattr(getattr(error, "response", None), "headers", None)
+    if not headers:
+        return None
+    try:
+        value = headers.get("retry-after")
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _request_completion(
+    messages: List[ChatCompletionMessageParam],
+    tools: List[ChatCompletionFunctionToolParam],
+    max_tokens: int,
+) -> ChatCompletion:
+    return client.chat.completions.create(
+        model=settings.llm.model,
+        messages=messages,
+        tools=tools,
+        prompt_cache_key=get_session_id(),
+        prompt_cache_options={"mode": "implicit"},
+        reasoning_effort="none",
+        max_completion_tokens=max_tokens,
+    )
+
+
+def _handle_bad_request(
+    error: BadRequestError,
+    messages: List[ChatCompletionMessageParam],
+) -> bool:
+    print(f"BadRequestError: {error.message}")
+    print(f"Request details: {error.code}, {error.param}, {error.type}")
+
+    if error.code == "context_length_exceeded":
+        print("[llm] Context length exceeded. Compacting messages and retrying...")
+        messages[:] = compact_messages(messages)
+        return True
+
+    if error.code == "content_filter":
+        print("[llm] Content filter triggered.")
+
+    return False
+
+
+def _wait_before_retry(attempt: int, error: Exception) -> None:
+    delay = backoff_delay(attempt, _retry_after(error))
+    print(f"Attempt {attempt + 1} failed. Retrying in {delay:.1f} seconds...")
+    time.sleep(delay)
+
 
 def create_completion(
     messages: List[ChatCompletionMessageParam],
     tools: List[ChatCompletionFunctionToolParam],
-    max_tokens: int = 1024,
+    max_tokens: int = settings.llm.default_max_tokens,
 ) -> ChatCompletion:
-    max_retries = 5
-    exponential_backoff = 2
-    for attempt in range(max_retries):
+    last_error: Exception | None = None
+
+    for attempt in range(settings.llm.max_retries):
+        if needs_compaction(messages):
+            messages[:] = compact_messages(messages)
         try:
-            res = client.chat.completions.create(
-                model=MODEL,
-                messages=messages,
-                tools=tools,
-                prompt_cache_key=get_session_id(),
-                prompt_cache_options={"mode": "implicit"},
-                reasoning_effort="none",
-                max_completion_tokens=max_tokens,
-            )
-            return res
-        except BadRequestError as e:
-            print(f"BadRequestError: {e.message}")
-            print(f"Request details: {e.code}, {e.param}, {e.type}")
-            if e.code == "context_length_exceeded":
-                print("[llm] Context length exceeded. Trimming messages and retrying...")
-                compact_messages = messages[-10:]
-                for i in range(len(compact_messages)):
-                    content = compact_messages[i].get("content")
-                    if isinstance(content, str) and len(content) > 1000:
-                        compact_messages[i]["content"] = content[:1000] + "..."
-                messages = compact_messages
-            elif e.code == "content_filter":
-                print("[llm] Content filter triggered.")
-                pass
-        except InternalServerError as e:
-            print(f"[llm] Internal server error: {e.message}. Retrying...")
-        except RateLimitError as e:
-            print(f"[llm] Rate limit exceeded: {e.message}. Retrying...")
-        except APIConnectionError as e:
-            print(f"[llm] API connection error: {e.message}. Retrying...")
-        print(f"Attempt {attempt + 1} failed. Retrying in {exponential_backoff ** attempt} seconds...")
-        time.sleep(exponential_backoff ** attempt)
-    raise Exception("Failed to create completion after multiple attempts.")
+            return _request_completion(messages, tools, max_tokens)
+        except BadRequestError as error:
+            if not _handle_bad_request(error, messages):
+                raise
+            last_error = error
+        except RETRYABLE_ERRORS as error:
+            reason = _retry_reason(error)
+            print(f"[llm] {reason}: {error.message}. Retrying...")
+            last_error = error
+
+        if attempt < settings.llm.max_retries - 1 and last_error is not None:
+            _wait_before_retry(attempt, last_error)
+
+    raise CompletionFailedError(
+        "Failed to create completion after multiple attempts."
+    ) from last_error
