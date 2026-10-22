@@ -261,20 +261,6 @@ class HarnessApp(App):
         overflow-x: hidden;
     }
 
-    #subagent-indicator {
-        display: none;
-        width: 1fr;
-        height: auto;
-        max-height: 4;
-        padding: 0 1;
-        border-top: solid $primary;
-        color: $text-muted;
-    }
-
-    #subagent-indicator.visible {
-        display: block;
-    }
-
     #loading {
         height: 1;
         padding: 0 1;
@@ -499,7 +485,6 @@ class HarnessApp(App):
                 with Vertical(id="subagent-view"):
                     yield Static("", id="subagent-header")
                     yield VerticalScroll(id="subagent-log")
-                yield Static("", id="subagent-indicator")
                 yield Horizontal(
                     Static(SPINNER_FRAMES[0], id="spinner"),
                     Static("Agent is thinking\u2026", id="loading-label"),
@@ -898,7 +883,6 @@ class HarnessApp(App):
 
             self._append_subagent_card(state)
             self._refresh_subagent_list()
-            self._update_subagent_indicator()
             self._update_loading_for_subagents()
             if self._view_mode == "subagents":
                 self._select_subagent(state.id)
@@ -913,7 +897,6 @@ class HarnessApp(App):
             state.finished_at = time.monotonic()
             self._update_subagent_card(state)
             self._refresh_subagent_list()
-            self._update_subagent_indicator()
             if (
                 self._view_mode == "subagents"
                 and self._selected_subagent_id == state.id
@@ -953,7 +936,6 @@ class HarnessApp(App):
             self.call_after_refresh(self._scroll_subagent_log)
             self._update_subagent_header()
 
-        self._update_subagent_indicator()
 
     def _append_subagent_entry(
         self,
@@ -1057,7 +1039,6 @@ class HarnessApp(App):
             if state.status == "running":
                 self._update_subagent_card(state)
 
-        self._update_subagent_indicator()
         if self._view_mode == "subagents":
             self._update_subagent_header()
 
@@ -1128,53 +1109,6 @@ class HarnessApp(App):
             (state.name, "bold"),
             (f"  {_format_elapsed(state.elapsed)}", "dim"),
         )
-
-    def _update_subagent_indicator(self) -> None:
-        try:
-            indicator = self.query_one("#subagent-indicator", Static)
-        except Exception:
-            return
-
-        if not self._subagents:
-            indicator.update("")
-            indicator.remove_class("visible")
-            return
-
-        states = sorted(
-            self._subagents.values(), key=lambda state: state.started
-        )[-4:]
-
-        body = Text()
-        for index, state in enumerate(states):
-            if index:
-                body.append("\n")
-            if state.status == "running":
-                frame = SPINNER_FRAMES[
-                    self._spinner_index % len(SPINNER_FRAMES)
-                ]
-                body.append(f"{frame} ", style="bold yellow")
-                body.append(state.name, style="bold cyan")
-                body.append(
-                    f" running for {_format_elapsed(state.elapsed)}",
-                    style="dim",
-                )
-            elif state.status == "completed":
-                body.append("\u2713 ", style="green")
-                body.append(state.name, style="bold")
-                body.append(
-                    f" finished in {_format_elapsed(state.elapsed)}",
-                    style="dim",
-                )
-            else:
-                body.append("\u2717 ", style="bold red")
-                body.append(state.name, style="bold")
-                body.append(
-                    f" failed after {_format_elapsed(state.elapsed)}",
-                    style="dim",
-                )
-
-        indicator.update(body)
-        indicator.add_class("visible")
 
     def _update_subagent_header(self) -> None:
         try:
@@ -1623,6 +1557,25 @@ def _format_elapsed(seconds: float) -> str:
     return f"{minutes}m {remainder:02d}s"
 
 
+def _subagent_tool_title(entry: SubagentEntry) -> tuple[str, bool]:
+    match = re.search(r"['\"]path['\"]\s*:\s*['\"]([^'\"]+)", entry.text)
+    path = match.group(1) if match else ""
+
+    if entry.tool_name == "read_file":
+        title = "\U0001f4d6 read_file"
+        if path:
+            title += f" \u00b7 {_shorten(path, 60)}"
+        return title, True
+
+    if entry.tool_name == "write_file":
+        title = "\U0001f4dd write_file"
+        if path:
+            title += f" \u00b7 {_shorten(path, 60)}"
+        return title, False
+
+    return f"\U0001f527 {entry.tool_name}", False
+
+
 def _build_subagent_entry(entry: SubagentEntry) -> Widget:
     if entry.kind == "assistant":
         content = Static(RichMarkdown(entry.text))
@@ -1638,10 +1591,11 @@ def _build_subagent_entry(entry: SubagentEntry) -> Widget:
             Text(_shorten(entry.text, 4000)), classes="tool-details"
         )
         entry.content_widget = details
+        title, collapsed = _subagent_tool_title(entry)
         return Collapsible(
             details,
-            title=escape(f"\U0001f527 {entry.tool_name}"),
-            collapsed=False,
+            title=escape(title),
+            collapsed=collapsed,
             classes="tool-call",
         )
 
