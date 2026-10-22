@@ -2,7 +2,9 @@ import io
 import json
 import re
 import threading
+import time
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from openai.types.chat import (
@@ -18,6 +20,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
+from textual.widget import Widget
 from textual.widgets import (
     Button,
     Collapsible,
@@ -33,6 +36,12 @@ from textual.widgets.option_list import Option
 from core.agent import run_turn
 from core.compact import compact_messages
 from core.output import clear_output_listener, set_output_listener
+from core.subagent import (
+    SubagentEvent,
+    add_subagent_listener,
+    remove_subagent_listener,
+    terminate_subagents,
+)
 from core.user_input import EXIT_COMMANDS
 from services import tools as tools_service
 from services.hooks import (
@@ -82,6 +91,39 @@ _COMPACT_STATS = re.compile(
     r"messages (\d+)->(\d+) \(([+-]?\d+)\) \| chars (\d+)->(\d+)"
 )
 _TAGGED_LINE = re.compile(r"^\[[A-Za-z][\w.-]*\]\s")
+_TOOL_CALL_RE = re.compile(r"^[A-Za-z_][\w.]*\(")
+
+SUBAGENT_STATUS_STYLES = {
+    "running": ("\u25b8", "bold yellow"),
+    "completed": ("\u2713", "green"),
+    "error": ("\u2717", "bold red"),
+}
+
+
+@dataclass
+class SubagentEntry:
+    kind: str
+    text: str
+    tool_name: str = ""
+    widget: Widget | None = field(default=None, repr=False)
+    content_widget: Static | None = field(default=None, repr=False)
+
+
+@dataclass
+class SubagentState:
+    id: str
+    name: str
+    query: str
+    started: float = field(default_factory=time.monotonic)
+    status: str = "running"
+    finished_at: float | None = None
+    entries: list[SubagentEntry] = field(default_factory=list)
+    card_status: Static | None = field(default=None, repr=False)
+
+    @property
+    def elapsed(self) -> float:
+        end = self.finished_at if self.finished_at is not None else time.monotonic()
+        return max(0.0, end - self.started)
 
 
 class _TUILogWriter(io.TextIOBase):
@@ -190,6 +232,49 @@ class HarnessApp(App):
         overflow-x: hidden;
     }
 
+    #history.hidden {
+        display: none;
+    }
+
+    #subagent-view {
+        display: none;
+        width: 1fr;
+        height: 1fr;
+        border: round $accent;
+    }
+
+    #subagent-view.visible {
+        display: block;
+    }
+
+    #subagent-header {
+        width: 1fr;
+        height: auto;
+        padding: 0 1;
+    }
+
+    #subagent-log {
+        width: 1fr;
+        height: 1fr;
+        padding: 0 1;
+        scrollbar-gutter: stable;
+        overflow-x: hidden;
+    }
+
+    #subagent-indicator {
+        display: none;
+        width: 1fr;
+        height: auto;
+        max-height: 4;
+        padding: 0 1;
+        border-top: solid $primary;
+        color: $text-muted;
+    }
+
+    #subagent-indicator.visible {
+        display: block;
+    }
+
     #loading {
         height: 1;
         padding: 0 1;
@@ -216,13 +301,50 @@ class HarnessApp(App):
         color: $text-muted;
     }
 
-    #todos {
+    #sidebar {
         width: 42;
+        height: 1fr;
+    }
+
+    #todos {
+        width: 1fr;
         height: 1fr;
         border: round $secondary;
         padding: 0 1;
         scrollbar-gutter: stable;
         overflow-x: hidden;
+    }
+
+    #subagent-list {
+        width: 1fr;
+        height: auto;
+        max-height: 12;
+        border: round $secondary;
+        background: $surface;
+    }
+
+    .subagent-card {
+        width: 1fr;
+        height: auto;
+        margin: 0 0 1 0;
+        padding: 0 1;
+        border-left: thick $accent;
+        background: $surface;
+    }
+
+    .subagent-title {
+        height: 1;
+    }
+
+    .subagent-query {
+        width: 1fr;
+        height: auto;
+        color: $text-muted;
+    }
+
+    .subagent-status {
+        width: 1fr;
+        height: 1;
     }
 
     #suggestions {
@@ -328,6 +450,13 @@ class HarnessApp(App):
 
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit"),
+        Binding(
+            "tab",
+            "toggle_subagent_view",
+            "Subagents",
+            priority=True,
+        ),
+        Binding("escape", "back_to_main", "Back", show=False),
     ]
 
     def __init__(self, args) -> None:
@@ -355,24 +484,37 @@ class HarnessApp(App):
 
         self._permission_events: set[threading.Event] = set()
 
+        self._thread_id = threading.get_ident()
+        self._view_mode = "main"
+        self._subagents: dict[str, SubagentState] = {}
+        self._selected_subagent_id: str | None = None
+        self._subagent_option_ids: list[str] = []
+        self._subagent_tick = 0
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="body"):
             with Vertical(id="history-panel"):
                 yield VerticalScroll(id="history")
+                with Vertical(id="subagent-view"):
+                    yield Static("", id="subagent-header")
+                    yield VerticalScroll(id="subagent-log")
+                yield Static("", id="subagent-indicator")
                 yield Horizontal(
                     Static(SPINNER_FRAMES[0], id="spinner"),
                     Static("Agent is thinking\u2026", id="loading-label"),
                     id="loading",
                 )
-            yield RichLog(
-                id="todos",
-                markup=False,
-                wrap=True,
-                min_width=1,
-                highlight=False,
-                max_lines=500,
-            )
+            with Vertical(id="sidebar"):
+                yield RichLog(
+                    id="todos",
+                    markup=False,
+                    wrap=True,
+                    min_width=1,
+                    highlight=False,
+                    max_lines=500,
+                )
+                yield OptionList(id="subagent-list", compact=True)
         yield Vertical(
             OptionList(id="command-list", compact=True),
             id="suggestions",
@@ -386,14 +528,18 @@ class HarnessApp(App):
     def on_mount(self) -> None:
         self.query_one("#history-panel").border_title = "Conversation"
         self.query_one("#todos", RichLog).border_title = "Todos"
+        self.query_one("#subagent-list", OptionList).border_title = "Subagents"
 
         set_output_listener(self._output_event)
         set_prompt_handler(self._ask_permission)
+        add_subagent_listener(self._subagent_event)
         register_hook("PreToolCall", self._pre_tool_call)
         register_hook("PostToolCall", self._post_tool_call)
         self.set_interval(0.08, self._tick_spinner)
+        self.set_interval(0.5, self._tick_subagents)
 
         self._refresh_todos()
+        self._refresh_subagent_list()
         self._append_history(
             Static(
                 Text(
@@ -413,6 +559,8 @@ class HarnessApp(App):
     def on_unmount(self) -> None:
         clear_output_listener()
         clear_prompt_handler()
+        remove_subagent_listener(self._subagent_event)
+        terminate_subagents()
         unregister_hook("PreToolCall", self._pre_tool_call)
         unregister_hook("PostToolCall", self._post_tool_call)
         for event in list(self._permission_events):
@@ -422,7 +570,7 @@ class HarnessApp(App):
     # input and command suggestions
     # ------------------------------------------------------------------
     def on_key(self, event: events.Key) -> None:
-        if not self._suggestions_visible:
+        if self._view_mode != "main" or not self._suggestions_visible:
             return
 
         if event.key == "down":
@@ -656,6 +804,455 @@ class HarnessApp(App):
         )
 
     # ------------------------------------------------------------------
+    # subagents
+    # ------------------------------------------------------------------
+    def action_toggle_subagent_view(self) -> None:
+        if self._view_mode == "subagents":
+            self._show_main_view()
+        else:
+            self._show_subagent_view()
+
+    def action_back_to_main(self) -> None:
+        if self._view_mode == "subagents":
+            self._show_main_view()
+
+    def _show_subagent_view(self) -> None:
+        self._hide_suggestions()
+        self._view_mode = "subagents"
+        self.query_one("#history").add_class("hidden")
+        self.query_one("#subagent-view").add_class("visible")
+
+        if self._subagents:
+            self._selected_subagent_id = max(
+                self._subagents.values(), key=lambda state: state.started
+            ).id
+
+        self._refresh_subagent_list()
+        self._select_subagent(self._selected_subagent_id)
+        self.call_after_refresh(self._render_selected_subagent)
+
+        try:
+            self.query_one("#subagent-list", OptionList).focus()
+        except Exception:
+            pass
+
+    def _show_main_view(self) -> None:
+        self._view_mode = "main"
+        self.query_one("#subagent-view").remove_class("visible")
+        self.query_one("#history").remove_class("hidden")
+        self._scroll_history_end()
+        if not self._busy:
+            self.query_one("#query", Input).focus()
+
+    def _select_subagent(self, subagent_id: str | None) -> None:
+        self._selected_subagent_id = subagent_id
+        if subagent_id is None:
+            return
+
+        try:
+            option_list = self.query_one("#subagent-list", OptionList)
+            if subagent_id in self._subagent_option_ids:
+                option_list.highlighted = self._subagent_option_ids.index(
+                    subagent_id
+                )
+        except Exception:
+            pass
+
+    def _selected_subagent(self) -> SubagentState | None:
+        if self._selected_subagent_id is None:
+            return None
+        return self._subagents.get(self._selected_subagent_id)
+
+    @on(OptionList.OptionHighlighted, "#subagent-list")
+    def _subagent_highlighted(
+        self, event: OptionList.OptionHighlighted
+    ) -> None:
+        option_id = str(event.option.id or "")
+        if not option_id or option_id == "__empty__":
+            return
+        self._selected_subagent_id = option_id
+        if self._view_mode == "subagents":
+            self._render_selected_subagent()
+
+    def _subagent_event(self, event: SubagentEvent) -> None:
+        if threading.get_ident() == self._thread_id:
+            self._handle_subagent_event(event)
+            return
+        try:
+            self.call_from_thread(self._handle_subagent_event, event)
+        except RuntimeError:
+            pass
+
+    def _handle_subagent_event(self, event: SubagentEvent) -> None:
+        state = self._subagents.get(event.subagent_id)
+
+        if event.kind == "spawned":
+            state = SubagentState(
+                id=event.subagent_id,
+                name=event.name,
+                query=event.query,
+            )
+            self._subagents[event.subagent_id] = state
+            if self._selected_subagent_id is None:
+                self._selected_subagent_id = state.id
+
+            self._append_subagent_card(state)
+            self._refresh_subagent_list()
+            self._update_subagent_indicator()
+            self._update_loading_for_subagents()
+            if self._view_mode == "subagents":
+                self._select_subagent(state.id)
+                self._render_selected_subagent()
+            return
+
+        if state is None:
+            return
+
+        if event.kind == "finished":
+            state.status = event.status or "completed"
+            state.finished_at = time.monotonic()
+            self._update_subagent_card(state)
+            self._refresh_subagent_list()
+            self._update_subagent_indicator()
+            if (
+                self._view_mode == "subagents"
+                and self._selected_subagent_id == state.id
+            ):
+                self._update_subagent_header()
+            self._update_loading_for_subagents()
+            return
+
+        entry, created = self._append_subagent_entry(
+            state, event.kind, event.text
+        )
+        if len(state.entries) > 2000:
+            removed = state.entries[:1000]
+            if (
+                self._view_mode == "subagents"
+                and self._selected_subagent_id == state.id
+            ):
+                for old_entry in removed:
+                    if old_entry.widget is not None:
+                        try:
+                            old_entry.widget.remove()
+                        except Exception:
+                            pass
+            del state.entries[:1000]
+
+        if (
+            self._view_mode == "subagents"
+            and self._selected_subagent_id == state.id
+        ):
+            if created and entry.widget is not None:
+                try:
+                    self.query_one(
+                        "#subagent-log", VerticalScroll
+                    ).mount(entry.widget)
+                except Exception:
+                    pass
+            self.call_after_refresh(self._scroll_subagent_log)
+            self._update_subagent_header()
+
+        self._update_subagent_indicator()
+
+    def _append_subagent_entry(
+        self,
+        state: SubagentState,
+        kind: str,
+        text: str,
+    ) -> tuple[SubagentEntry, bool]:
+        last = state.entries[-1] if state.entries else None
+
+        if kind == "assistant" and last is not None and last.kind == "assistant":
+            last.text = f"{last.text}\n{text}" if last.text else text
+            if last.content_widget is not None:
+                last.content_widget.update(RichMarkdown(last.text))
+            return last, False
+
+        if (
+            kind == "tool"
+            and last is not None
+            and last.kind == "tool"
+            and not _TOOL_CALL_RE.match(text)
+        ):
+            last.text = f"{last.text}\n{text}"
+            if last.content_widget is not None:
+                last.content_widget.update(
+                    Text(_shorten(last.text, 4000))
+                )
+            return last, False
+
+        entry_kind = kind if kind in ("assistant", "tool", "error") else "status"
+        tool_name = _tool_name(text) if entry_kind == "tool" else ""
+        entry = SubagentEntry(
+            kind=entry_kind,
+            text=text,
+            tool_name=tool_name,
+        )
+        entry.widget = _build_subagent_entry(entry)
+        state.entries.append(entry)
+        return entry, True
+
+    def _scroll_subagent_log(self) -> None:
+        try:
+            self.query_one("#subagent-log", VerticalScroll).scroll_end(
+                animate=False
+            )
+        except Exception:
+            pass
+
+    def _append_subagent_card(self, state: SubagentState) -> None:
+        title = Text()
+        title.append("\u25c6 ", style="bold cyan")
+        title.append(state.name, style="bold cyan")
+        title.append("  spawned", style="dim")
+
+        query = Static(Text(state.query), classes="subagent-query")
+        status = Static(Text("Starting\u2026", style="dim"),
+                        classes="subagent-status")
+        state.card_status = status
+
+        card = Vertical(
+            Static(title, classes="subagent-title"),
+            query,
+            status,
+            classes="message subagent-card",
+        )
+        self._append_history(card)
+        self._update_subagent_card(state)
+
+    def _update_subagent_card(self, state: SubagentState) -> None:
+        status = state.card_status
+        if status is None:
+            return
+
+        if state.status == "running":
+            frame = SPINNER_FRAMES[self._spinner_index % len(SPINNER_FRAMES)]
+            status.update(
+                Text(
+                    f"{frame} running for {_format_elapsed(state.elapsed)}",
+                    style="yellow",
+                )
+            )
+        elif state.status == "completed":
+            status.update(
+                Text(
+                    f"\u2713 completed in {_format_elapsed(state.elapsed)}",
+                    style="green",
+                )
+            )
+        else:
+            status.update(
+                Text(
+                    f"\u2717 failed after {_format_elapsed(state.elapsed)}",
+                    style="bold red",
+                )
+            )
+
+    def _tick_subagents(self) -> None:
+        if not self._subagents:
+            return
+
+        for state in self._subagents.values():
+            if state.status == "running":
+                self._update_subagent_card(state)
+
+        self._update_subagent_indicator()
+        if self._view_mode == "subagents":
+            self._update_subagent_header()
+
+        self._subagent_tick += 1
+        if self._subagent_tick % 2 == 0:
+            self._refresh_subagent_list()
+
+    def _refresh_subagent_list(self) -> None:
+        try:
+            option_list = self.query_one("#subagent-list", OptionList)
+        except Exception:
+            return
+
+        states = sorted(
+            self._subagents.values(), key=lambda state: state.started
+        )
+        ids = [state.id for state in states]
+
+        if not ids:
+            self._subagent_option_ids = []
+            if option_list.option_count == 0:
+                option_list.set_options(
+                    [
+                        Option(
+                            Text("No subagents yet", style="dim"),
+                            id="__empty__",
+                            disabled=True,
+                        )
+                    ]
+                )
+            return
+
+        if ids != self._subagent_option_ids:
+            self._subagent_option_ids = ids
+            selected = (
+                self._selected_subagent_id
+                if self._selected_subagent_id in ids
+                else ids[0]
+            )
+            self._selected_subagent_id = selected
+            option_list.set_options(
+                Option(self._subagent_option_prompt(state), id=state.id)
+                for state in states
+            )
+            if selected in ids:
+                option_list.highlighted = ids.index(selected)
+            return
+
+        for index, state in enumerate(states):
+            try:
+                option_list.replace_option_prompt_at_index(
+                    index, self._subagent_option_prompt(state)
+                )
+            except Exception:
+                pass
+
+    def _subagent_option_prompt(self, state: SubagentState) -> Text:
+        if state.status == "running":
+            icon = SPINNER_FRAMES[self._spinner_index % len(SPINNER_FRAMES)]
+            style = "bold yellow"
+        else:
+            icon, style = SUBAGENT_STATUS_STYLES.get(
+                state.status, ("\u2022", "dim")
+            )
+
+        return Text.assemble(
+            (f"{icon} ", style),
+            (state.name, "bold"),
+            (f"  {_format_elapsed(state.elapsed)}", "dim"),
+        )
+
+    def _update_subagent_indicator(self) -> None:
+        try:
+            indicator = self.query_one("#subagent-indicator", Static)
+        except Exception:
+            return
+
+        if not self._subagents:
+            indicator.update("")
+            indicator.remove_class("visible")
+            return
+
+        states = sorted(
+            self._subagents.values(), key=lambda state: state.started
+        )[-4:]
+
+        body = Text()
+        for index, state in enumerate(states):
+            if index:
+                body.append("\n")
+            if state.status == "running":
+                frame = SPINNER_FRAMES[
+                    self._spinner_index % len(SPINNER_FRAMES)
+                ]
+                body.append(f"{frame} ", style="bold yellow")
+                body.append(state.name, style="bold cyan")
+                body.append(
+                    f" running for {_format_elapsed(state.elapsed)}",
+                    style="dim",
+                )
+            elif state.status == "completed":
+                body.append("\u2713 ", style="green")
+                body.append(state.name, style="bold")
+                body.append(
+                    f" finished in {_format_elapsed(state.elapsed)}",
+                    style="dim",
+                )
+            else:
+                body.append("\u2717 ", style="bold red")
+                body.append(state.name, style="bold")
+                body.append(
+                    f" failed after {_format_elapsed(state.elapsed)}",
+                    style="dim",
+                )
+
+        indicator.update(body)
+        indicator.add_class("visible")
+
+    def _update_subagent_header(self) -> None:
+        try:
+            header = self.query_one("#subagent-header", Static)
+        except Exception:
+            return
+
+        state = self._selected_subagent()
+        if state is None:
+            header.update(Text("No subagent selected", style="dim"))
+            return
+
+        icon, style = SUBAGENT_STATUS_STYLES.get(
+            state.status, ("\u2022", "dim")
+        )
+        body = Text()
+        body.append(f"{icon} ", style=style)
+        body.append(state.name, style="bold cyan")
+        body.append(f"  {state.status}", style=style)
+        body.append(f"  {_format_elapsed(state.elapsed)}", style="dim")
+        body.append("\n")
+        body.append("Query: ", style="dim")
+        body.append(state.query)
+        header.update(body)
+
+    def _render_selected_subagent(self) -> None:
+        try:
+            log = self.query_one("#subagent-log", VerticalScroll)
+        except Exception:
+            return
+
+        log.remove_children()
+        state = self._selected_subagent()
+        if state is None:
+            log.mount(
+                Static(
+                    Text("No subagent selected.", style="dim"),
+                    classes="message system-message",
+                )
+            )
+            self._update_subagent_header()
+            return
+
+        if not state.entries:
+            log.mount(
+                Static(
+                    Text("Waiting for output\u2026", style="dim"),
+                    classes="message system-message",
+                )
+            )
+        else:
+            widgets = []
+            for entry in state.entries:
+                entry.widget = _build_subagent_entry(entry)
+                widgets.append(entry.widget)
+            if widgets:
+                log.mount_all(widgets)
+
+        self.call_after_refresh(self._scroll_subagent_log)
+        self._update_subagent_header()
+
+    def _update_loading_for_subagents(self) -> None:
+        if not self._busy:
+            return
+
+        running = [
+            state.name
+            for state in self._subagents.values()
+            if state.status == "running"
+        ]
+        if running:
+            self._set_loading(
+                True, f"Waiting for subagent {', '.join(running)}\u2026"
+            )
+        else:
+            self._set_loading(True, "Agent is thinking\u2026")
+
+    # ------------------------------------------------------------------
     # history rendering
     # ------------------------------------------------------------------
     def _append_history(self, widget) -> None:
@@ -844,6 +1441,9 @@ class HarnessApp(App):
         self._append_history(widget)
 
     def _start_tool_widget(self, name: str, body: str) -> None:
+        if name == "spawn_subagent":
+            return
+
         details = Static(Text(body), classes="tool-details")
         collapsible = Collapsible(
             details,
@@ -1013,6 +1613,48 @@ class HarnessApp(App):
                 yield
             finally:
                 writer.flush()
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, remainder = divmod(total, 60)
+    return f"{minutes}m {remainder:02d}s"
+
+
+def _build_subagent_entry(entry: SubagentEntry) -> Widget:
+    if entry.kind == "assistant":
+        content = Static(RichMarkdown(entry.text))
+        entry.content_widget = content
+        return Vertical(
+            Static("Agent", classes="role agent-role"),
+            content,
+            classes="message agent-message",
+        )
+
+    if entry.kind == "tool":
+        details = Static(
+            Text(_shorten(entry.text, 4000)), classes="tool-details"
+        )
+        entry.content_widget = details
+        return Collapsible(
+            details,
+            title=escape(f"\U0001f527 {entry.tool_name}"),
+            collapsed=False,
+            classes="tool-call",
+        )
+
+    if entry.kind == "error":
+        return Static(
+            Text(_shorten(entry.text, 4000)),
+            classes="message error-message",
+        )
+
+    return Static(
+        Text(_shorten(entry.text, 4000)),
+        classes="message system-message",
+    )
 
 
 def _shorten(text: str, limit: int = 600) -> str:
