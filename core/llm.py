@@ -14,6 +14,7 @@ MODEL = "gpt-5.6-luna"
 def create_completion(
     messages: List[ChatCompletionMessageParam],
     tools: List[ChatCompletionFunctionToolParam],
+    max_tokens: int = 1024,
 ) -> ChatCompletion:
     max_retries = 5
     exponential_backoff = 2
@@ -26,19 +27,29 @@ def create_completion(
                 prompt_cache_key=get_session_id(),
                 prompt_cache_options={"mode": "implicit"},
                 reasoning_effort="none",
+                max_completion_tokens=max_tokens,
             )
             return res
         except BadRequestError as e:
             print(f"BadRequestError: {e.message}")
-            # identify different 400 possible then handle accordingly
-            # have to find a way to parse the error message to identify the specific issue
-            pass
+            print(f"Request details: {e.code}, {e.param}, {e.type}")
+            if e.code == "context_length_exceeded":
+                print("[llm] Context length exceeded. Trimming messages and retrying...")
+                compact_messages = messages[-10:]
+                for i in range(len(compact_messages)):
+                    content = compact_messages[i].get("content")
+                    if isinstance(content, str) and len(content) > 1000:
+                        compact_messages[i]["content"] = content[:1000] + "..."
+                messages = compact_messages
+            elif e.code == "content_filter":
+                print("[llm] Content filter triggered.")
+                pass
         except InternalServerError as e:
-            print(f"InternalServerError: {e.message}")
+            print(f"[llm] Internal server error: {e.message}. Retrying...")
         except RateLimitError as e:
-            pass
+            print(f"[llm] Rate limit exceeded: {e.message}. Retrying...")
         except APIConnectionError as e:
-            pass
+            print(f"[llm] API connection error: {e.message}. Retrying...")
         print(f"Attempt {attempt + 1} failed. Retrying in {exponential_backoff ** attempt} seconds...")
         time.sleep(exponential_backoff ** attempt)
     raise Exception("Failed to create completion after multiple attempts.")
