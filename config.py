@@ -93,7 +93,7 @@ class SubagentSettings:
 class BackgroundSettings:
     max_tasks: int = _env_int("BACKGROUND_MAX_TASKS", 4)
     output_limit_chars: int = _env_int("BACKGROUND_OUTPUT_LIMIT", 8000)
-    pattern_grace: float = _env_float("BACKGROUND_PATTERN_GRACE", 2.0)
+    pattern_grace: float = _env_float("BACKGROUND_PATTERN_GRACE", 4.0)
     foreground_timeout: float = _env_float("BACKGROUND_FOREGROUND_TIMEOUT", 30.0)
     auto_detect: bool = _env_bool("BACKGROUND_AUTO_DETECT", True)
 
