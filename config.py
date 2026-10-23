@@ -16,6 +16,13 @@ def _env_float(name: str, default: float) -> float:
     return float(value) if value else default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _env_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
     value = os.getenv(name)
     if not value:
@@ -74,9 +81,39 @@ class CompactionSettings:
 
 
 @dataclass(frozen=True)
+class SubagentSettings:
+    max_parallel: int = _env_int("SUBAGENT_MAX_PARALLEL", 4)
+
+    def __post_init__(self) -> None:
+        if self.max_parallel < 1:
+            raise ValueError("max_parallel must be >= 1")
+
+
+@dataclass(frozen=True)
+class BackgroundSettings:
+    max_tasks: int = _env_int("BACKGROUND_MAX_TASKS", 4)
+    output_limit_chars: int = _env_int("BACKGROUND_OUTPUT_LIMIT", 8000)
+    pattern_grace: float = _env_float("BACKGROUND_PATTERN_GRACE", 2.0)
+    foreground_timeout: float = _env_float("BACKGROUND_FOREGROUND_TIMEOUT", 30.0)
+    auto_detect: bool = _env_bool("BACKGROUND_AUTO_DETECT", True)
+
+    def __post_init__(self) -> None:
+        if self.max_tasks < 1:
+            raise ValueError("max_tasks must be >= 1")
+        if self.output_limit_chars < 1:
+            raise ValueError("output_limit_chars must be >= 1")
+        if self.pattern_grace < 0:
+            raise ValueError("pattern_grace must be >= 0")
+        if self.foreground_timeout < 0:
+            raise ValueError("foreground_timeout must be >= 0")
+
+
+@dataclass(frozen=True)
 class Settings:
     llm: LLMSettings = field(default_factory=LLMSettings)
     compaction: CompactionSettings = field(default_factory=CompactionSettings)
+    subagents: SubagentSettings = field(default_factory=SubagentSettings)
+    background: BackgroundSettings = field(default_factory=BackgroundSettings)
 
 
 settings = Settings()

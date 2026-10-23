@@ -49,6 +49,7 @@ _listeners_lock = threading.Lock()
 
 _procs: dict[str, subprocess.Popen[str]] = {}
 _procs_lock = threading.Lock()
+_print_lock = threading.Lock()
 
 
 def add_subagent_listener(listener: SubagentListener) -> None:
@@ -198,14 +199,15 @@ def publish_event(event: SubagentEvent) -> None:
 
 
 def _print_event(event: SubagentEvent) -> None:
-    if event.kind == "spawned":
-        print(f"[subagent] {event.name} spawned: {event.query}")
-    elif event.kind == "finished":
-        print(
-            f"[subagent] {event.name} {event.status} in {event.elapsed:.1f}s"
-        )
-    elif event.text:
-        print(event.text)
+    with _print_lock:
+        if event.kind == "spawned":
+            print(f"[subagent] {event.name} spawned: {event.query}")
+        elif event.kind == "finished":
+            print(
+                f"[subagent] {event.name} {event.status} in {event.elapsed:.1f}s"
+            )
+        elif event.text:
+            print(event.text)
 
 
 def _consume_output(

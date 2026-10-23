@@ -3,6 +3,8 @@ import json
 import re
 import threading
 import time
+import uuid
+from collections import deque
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +36,14 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 from core.agent import run_turn
+from core.background import (
+    BackgroundEvent,
+    add_background_listener,
+    format_background_event,
+    remove_background_listener,
+    terminate_background_task,
+    terminate_background_tasks,
+)
 from core.compact import compact_messages
 from core.output import clear_output_listener, set_output_listener
 from core.subagent import (
@@ -99,6 +109,14 @@ SUBAGENT_STATUS_STYLES = {
     "error": ("\u2717", "bold red"),
 }
 
+BACKGROUND_STATUS_STYLES = {
+    "running": ("\u25b8", "bold yellow"),
+    "completed": ("\u2713", "green"),
+    "failed": ("\u2717", "bold red"),
+    "cancelled": ("\u2717", "dim"),
+    "cancelling": ("\u25b8", "yellow"),
+}
+
 
 @dataclass
 class SubagentEntry:
@@ -124,6 +142,33 @@ class SubagentState:
     def elapsed(self) -> float:
         end = self.finished_at if self.finished_at is not None else time.monotonic()
         return max(0.0, end - self.started)
+
+
+@dataclass
+class BackgroundState:
+    id: str
+    cmd: str
+    started: float = field(default_factory=time.monotonic)
+    status: str = "running"
+    stdout: str = ""
+    stderr: str = ""
+    return_code: int | None = None
+    error: str = ""
+    finished_at: float | None = None
+
+    @property
+    def elapsed(self) -> float:
+        end = self.finished_at if self.finished_at is not None else time.monotonic()
+        return max(0.0, end - self.started)
+
+
+@dataclass
+class TurnRequest:
+    kind: str
+    content: str
+    label: str
+    request_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    attempts: int = 0
 
 
 class _TUILogWriter(io.TextIOBase):
@@ -261,6 +306,31 @@ class HarnessApp(App):
         overflow-x: hidden;
     }
 
+    #background-view {
+        display: none;
+        width: 1fr;
+        height: 1fr;
+        border: round $warning;
+    }
+
+    #background-view.visible {
+        display: block;
+    }
+
+    #background-header {
+        width: 1fr;
+        height: auto;
+        padding: 0 1;
+    }
+
+    #background-log {
+        width: 1fr;
+        height: 1fr;
+        padding: 0 1;
+        scrollbar-gutter: stable;
+        overflow-x: hidden;
+    }
+
     #loading {
         height: 1;
         padding: 0 1;
@@ -309,6 +379,23 @@ class HarnessApp(App):
         background: $surface;
     }
 
+    #subagent-list.background-hidden {
+        display: none;
+    }
+
+    #background-list {
+        display: none;
+        width: 1fr;
+        height: auto;
+        max-height: 12;
+        border: round $warning;
+        background: $surface;
+    }
+
+    #background-list.visible {
+        display: block;
+    }
+
     .subagent-card {
         width: 1fr;
         height: auto;
@@ -330,6 +417,35 @@ class HarnessApp(App):
 
     .subagent-status {
         width: 1fr;
+        height: 1;
+    }
+
+    #turn-queue {
+        display: none;
+        height: auto;
+        max-height: 7;
+        margin: 0 1;
+        padding: 0 1;
+        border: round $warning;
+        background: $surface;
+    }
+
+    #turn-queue.visible {
+        display: block;
+    }
+
+    #turn-queue-header {
+        height: 1;
+        color: $warning;
+        text-style: bold;
+    }
+
+    #turn-queue-list {
+        height: auto;
+        max-height: 4;
+    }
+
+    .turn-queue-item {
         height: 1;
     }
 
@@ -442,6 +558,18 @@ class HarnessApp(App):
             "Subagents",
             priority=True,
         ),
+        Binding(
+            "shift+tab",
+            "toggle_background_view",
+            "Background",
+            priority=True,
+        ),
+        Binding(
+            "x",
+            "stop_background_task",
+            "Stop task",
+            show=False,
+        ),
         Binding("escape", "back_to_main", "Back", show=False),
     ]
 
@@ -477,6 +605,15 @@ class HarnessApp(App):
         self._subagent_option_ids: list[str] = []
         self._subagent_tick = 0
 
+        self._turn_queue: deque[TurnRequest] = deque()
+        self._current_request: TurnRequest | None = None
+        self._failed_request: TurnRequest | None = None
+
+        self._background: dict[str, BackgroundState] = {}
+        self._selected_background_id: str | None = None
+        self._background_option_ids: list[str] = []
+        self._background_tick = 0
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="body"):
@@ -485,6 +622,9 @@ class HarnessApp(App):
                 with Vertical(id="subagent-view"):
                     yield Static("", id="subagent-header")
                     yield VerticalScroll(id="subagent-log")
+                with Vertical(id="background-view"):
+                    yield Static("", id="background-header")
+                    yield VerticalScroll(id="background-log")
                 yield Horizontal(
                     Static(SPINNER_FRAMES[0], id="spinner"),
                     Static("Agent is thinking\u2026", id="loading-label"),
@@ -500,6 +640,12 @@ class HarnessApp(App):
                     max_lines=500,
                 )
                 yield OptionList(id="subagent-list", compact=True)
+                yield OptionList(id="background-list", compact=True)
+        yield Vertical(
+            Static("Queued turns", id="turn-queue-header"),
+            VerticalScroll(id="turn-queue-list"),
+            id="turn-queue",
+        )
         yield Vertical(
             OptionList(id="command-list", compact=True),
             id="suggestions",
@@ -514,17 +660,22 @@ class HarnessApp(App):
         self.query_one("#history-panel").border_title = "Conversation"
         self.query_one("#todos", RichLog).border_title = "Todos"
         self.query_one("#subagent-list", OptionList).border_title = "Subagents"
+        self.query_one("#background-list", OptionList).border_title = "Background"
 
         set_output_listener(self._output_event)
         set_prompt_handler(self._ask_permission)
         add_subagent_listener(self._subagent_event)
+        add_background_listener(self._background_event)
         register_hook("PreToolCall", self._pre_tool_call)
         register_hook("PostToolCall", self._post_tool_call)
         self.set_interval(0.08, self._tick_spinner)
         self.set_interval(0.5, self._tick_subagents)
+        self.set_interval(0.5, self._tick_background_tasks)
 
         self._refresh_todos()
         self._refresh_subagent_list()
+        self._refresh_background_list()
+        self._refresh_turn_queue()
         self._append_history(
             Static(
                 Text(
@@ -539,13 +690,21 @@ class HarnessApp(App):
         query_input.focus()
 
         if self.args.query:
-            self._start_turn(self.args.query)
+            self._enqueue_turn(
+                TurnRequest(
+                    kind="user",
+                    content=self.args.query,
+                    label=self.args.query,
+                )
+            )
 
     def on_unmount(self) -> None:
         clear_output_listener()
         clear_prompt_handler()
         remove_subagent_listener(self._subagent_event)
+        remove_background_listener(self._background_event)
         terminate_subagents()
+        terminate_background_tasks()
         unregister_hook("PreToolCall", self._pre_tool_call)
         unregister_hook("PostToolCall", self._post_tool_call)
         for event in list(self._permission_events):
@@ -579,7 +738,7 @@ class HarnessApp(App):
         query = event.value.strip()
         event.input.value = ""
 
-        if self._busy or self._quitting or not query:
+        if self._quitting or not query:
             return
 
         if self._suggestions_visible and self._suggested_commands:
@@ -596,11 +755,18 @@ class HarnessApp(App):
             await self._execute_command(query)
             return
 
-        self._start_turn(query)
+        self._enqueue_turn(
+            TurnRequest(kind="user", content=query, label=query)
+        )
 
     async def _execute_command(self, raw: str) -> None:
         command = raw.strip().lower()
         if command == "/compact":
+            if self._busy or self._current_request is not None:
+                self._write_error(
+                    "[command] /compact is unavailable while a turn is running"
+                )
+                return
             self._start_compact()
         elif command in EXIT_COMMANDS:
             await self.action_quit()
@@ -681,20 +847,59 @@ class HarnessApp(App):
     # ------------------------------------------------------------------
     # turns
     # ------------------------------------------------------------------
-    def _start_turn(self, query: str) -> None:
+    def _enqueue_turn(self, request: TurnRequest, front: bool = False) -> None:
+        if self._quitting:
+            return
+        if front:
+            self._turn_queue.appendleft(request)
+        else:
+            self._turn_queue.append(request)
+        self._refresh_turn_queue()
+        self._start_next_turn()
+
+    def _start_next_turn(self) -> None:
+        if (
+            self._busy
+            or self._quitting
+            or self._current_request is not None
+            or not self._turn_queue
+        ):
+            return
+
+        request = self._turn_queue.popleft()
+        if request.kind == "background":
+            batch = [request]
+            while self._turn_queue and self._turn_queue[0].kind == "background":
+                batch.append(self._turn_queue.popleft())
+            if len(batch) > 1:
+                request = TurnRequest(
+                    kind="background",
+                    content="\n\n".join(item.content for item in batch),
+                    label=f"{len(batch)} background updates",
+                    attempts=max(item.attempts for item in batch),
+                )
+
+        self._current_request = request
+        self._failed_request = None
         self._busy = True
         self._last_stream_kind = None
         self._active_tool_details = None
         self._active_tool_lines = []
         self._snapshot = list(self.messages)
 
-        self._write_user(query)
+        if request.kind == "user":
+            self._write_user(request.content)
+        else:
+            self._write_background_update(request.label)
+
         self.messages.append(
-            ChatCompletionUserMessageParam(role="user", content=query)
+            ChatCompletionUserMessageParam(
+                role="user", content=request.content
+            )
         )
+        self._refresh_turn_queue()
         self._set_loading(True, "Agent is thinking\u2026")
-        self.query_one("#query", Input).disabled = True
-        self.run_worker(self._worker_turn, thread=True, exclusive=True)
+        self.run_worker(self._worker_turn, thread=True)
 
     def _worker_turn(self) -> None:
         try:
@@ -702,15 +907,17 @@ class HarnessApp(App):
                 run_turn(self.messages)
         except Exception as error:
             self.messages[:] = self._snapshot
+            self._failed_request = self._current_request
             self._emit_lines([f"[error] turn failed: {error}"])
         finally:
             self._finish_turn_from_thread()
 
     def _start_compact(self) -> None:
         self._busy = True
+        self._current_request = None
+        self._failed_request = None
         self._set_loading(True, "Compacting conversation\u2026")
-        self.query_one("#query", Input).disabled = True
-        self.run_worker(self._worker_compact, thread=True, exclusive=True)
+        self.run_worker(self._worker_compact, thread=True)
 
     def _worker_compact(self) -> None:
         try:
@@ -730,18 +937,71 @@ class HarnessApp(App):
     def _finish_turn(self) -> None:
         self._busy = False
         self._set_loading(False)
+
+        failed = self._failed_request
+        self._failed_request = None
+        self._current_request = None
+
         if self._quitting:
             return
-        query_input = self.query_one("#query", Input)
-        query_input.disabled = False
-        query_input.focus()
+
+        if (
+            failed is not None
+            and failed.kind == "background"
+            and failed.attempts < 1
+        ):
+            failed.attempts += 1
+            self._turn_queue.appendleft(failed)
+
+        self._refresh_turn_queue()
+        if self._turn_queue:
+            self._start_next_turn()
+        else:
+            self.query_one("#query", Input).focus()
+
+    def _refresh_turn_queue(self) -> None:
+        try:
+            container = self.query_one("#turn-queue")
+            header = self.query_one("#turn-queue-header", Static)
+            queue_list = self.query_one("#turn-queue-list", VerticalScroll)
+        except Exception:
+            return
+
+        queue_list.remove_children()
+        if not self._turn_queue:
+            container.remove_class("visible")
+            header.update("Queued turns")
+            return
+
+        container.add_class("visible")
+        header.update(Text(f"Queued turns ({len(self._turn_queue)})"))
+
+        rows = []
+        for index, request in enumerate(self._turn_queue, start=1):
+            style = "cyan" if request.kind == "user" else "yellow"
+            label = _shorten(request.label.replace("\n", " "), 90)
+            rows.append(
+                Static(
+                    Text.assemble(
+                        (f"{index}. ", "dim"),
+                        (f"[{request.kind}] ", style),
+                        (label, ""),
+                    ),
+                    classes="turn-queue-item",
+                )
+            )
+        if rows:
+            queue_list.mount_all(rows)
 
     async def action_quit(self) -> None:
         if self._quitting:
             return
         self._quitting = True
+        self._turn_queue.clear()
+        self._refresh_turn_queue()
 
         if self._busy:
+            terminate_background_tasks()
             self.exit()
             return
 
@@ -751,6 +1011,7 @@ class HarnessApp(App):
             await worker.wait()
         except Exception:
             pass
+        terminate_background_tasks()
         self.exit()
 
     def _worker_stop(self) -> None:
@@ -797,15 +1058,35 @@ class HarnessApp(App):
         else:
             self._show_subagent_view()
 
-    def action_back_to_main(self) -> None:
-        if self._view_mode == "subagents":
+    def action_toggle_background_view(self) -> None:
+        if self._view_mode == "background":
             self._show_main_view()
+        else:
+            self._show_background_view()
+
+    def action_back_to_main(self) -> None:
+        if self._view_mode in {"subagents", "background"}:
+            self._show_main_view()
+
+    def action_stop_background_task(self) -> None:
+        if self._view_mode != "background":
+            return
+        state = self._selected_background()
+        if state is None or state.status != "running":
+            return
+        if terminate_background_task(state.id):
+            state.status = "cancelling"
+            self._refresh_background_list()
+            self._render_selected_background()
 
     def _show_subagent_view(self) -> None:
         self._hide_suggestions()
         self._view_mode = "subagents"
         self.query_one("#history").add_class("hidden")
+        self.query_one("#background-view").remove_class("visible")
         self.query_one("#subagent-view").add_class("visible")
+        self.query_one("#background-list").remove_class("visible")
+        self.query_one("#subagent-list").remove_class("background-hidden")
 
         if self._subagents:
             self._selected_subagent_id = max(
@@ -821,13 +1102,38 @@ class HarnessApp(App):
         except Exception:
             pass
 
+    def _show_background_view(self) -> None:
+        self._hide_suggestions()
+        self._view_mode = "background"
+        self.query_one("#history").add_class("hidden")
+        self.query_one("#subagent-view").remove_class("visible")
+        self.query_one("#background-view").add_class("visible")
+        self.query_one("#subagent-list").add_class("background-hidden")
+        self.query_one("#background-list").add_class("visible")
+
+        if self._background:
+            self._selected_background_id = max(
+                self._background.values(), key=lambda state: state.started
+            ).id
+
+        self._refresh_background_list()
+        self._select_background(self._selected_background_id)
+        self.call_after_refresh(self._render_selected_background)
+
+        try:
+            self.query_one("#background-list", OptionList).focus()
+        except Exception:
+            pass
+
     def _show_main_view(self) -> None:
         self._view_mode = "main"
         self.query_one("#subagent-view").remove_class("visible")
+        self.query_one("#background-view").remove_class("visible")
         self.query_one("#history").remove_class("hidden")
+        self.query_one("#subagent-list").remove_class("background-hidden")
+        self.query_one("#background-list").remove_class("visible")
         self._scroll_history_end()
-        if not self._busy:
-            self.query_one("#query", Input).focus()
+        self.query_one("#query", Input).focus()
 
     def _select_subagent(self, subagent_id: str | None) -> None:
         self._selected_subagent_id = subagent_id
@@ -1187,6 +1493,279 @@ class HarnessApp(App):
             self._set_loading(True, "Agent is thinking\u2026")
 
     # ------------------------------------------------------------------
+    # background tasks
+    # ------------------------------------------------------------------
+    def _background_event(self, event: BackgroundEvent) -> None:
+        if threading.get_ident() == self._thread_id:
+            self._handle_background_event(event)
+            return
+        try:
+            self.call_from_thread(self._handle_background_event, event)
+        except RuntimeError:
+            pass
+
+    def _handle_background_event(self, event: BackgroundEvent) -> None:
+        state = self._background.get(event.task_id)
+
+        if event.kind == "started":
+            if state is None:
+                state = BackgroundState(
+                    id=event.task_id,
+                    cmd=event.cmd,
+                    started=time.monotonic(),
+                )
+                self._background[event.task_id] = state
+                if self._selected_background_id is None:
+                    self._selected_background_id = state.id
+            else:
+                state.cmd = event.cmd or state.cmd
+
+            self._refresh_background_list()
+            if self._view_mode == "background":
+                self._select_background(state.id)
+                self._render_selected_background()
+            return
+
+        if state is None:
+            state = BackgroundState(
+                id=event.task_id,
+                cmd=event.cmd,
+                started=time.monotonic() - event.duration,
+            )
+            self._background[event.task_id] = state
+
+        state.status = event.status or event.kind
+        state.stdout = event.stdout
+        state.stderr = event.stderr
+        state.return_code = event.return_code
+        state.error = event.error
+        state.finished_at = time.monotonic()
+
+        self._refresh_background_list()
+        if self._view_mode == "background":
+            if self._selected_background_id == state.id:
+                self._render_selected_background()
+            else:
+                self._update_background_header()
+
+        if event.kind in {"completed", "failed"} and not self._quitting:
+            self._enqueue_turn(
+                TurnRequest(
+                    kind="background",
+                    content=format_background_event(event),
+                    label=f"{event.task_id} {event.kind}",
+                )
+            )
+
+    def _select_background(self, task_id: str | None) -> None:
+        self._selected_background_id = task_id
+        if task_id is None:
+            return
+
+        try:
+            option_list = self.query_one("#background-list", OptionList)
+            if task_id in self._background_option_ids:
+                option_list.highlighted = self._background_option_ids.index(
+                    task_id
+                )
+        except Exception:
+            pass
+
+    def _selected_background(self) -> BackgroundState | None:
+        if self._selected_background_id is None:
+            return None
+        return self._background.get(self._selected_background_id)
+
+    @on(OptionList.OptionHighlighted, "#background-list")
+    def _background_highlighted(
+        self, event: OptionList.OptionHighlighted
+    ) -> None:
+        option_id = str(event.option.id or "")
+        if not option_id or option_id == "__empty__":
+            return
+        self._selected_background_id = option_id
+        if self._view_mode == "background":
+            self._render_selected_background()
+
+    def _tick_background_tasks(self) -> None:
+        if not self._background:
+            return
+
+        if self._view_mode == "background":
+            self._update_background_header()
+
+        self._background_tick += 1
+        if self._background_tick % 2 == 0:
+            self._refresh_background_list()
+
+    def _refresh_background_list(self) -> None:
+        try:
+            option_list = self.query_one("#background-list", OptionList)
+        except Exception:
+            return
+
+        states = sorted(
+            self._background.values(), key=lambda state: state.started
+        )
+        ids = [state.id for state in states]
+
+        if not ids:
+            self._background_option_ids = []
+            if option_list.option_count == 0:
+                option_list.set_options(
+                    [
+                        Option(
+                            Text("No background tasks yet", style="dim"),
+                            id="__empty__",
+                            disabled=True,
+                        )
+                    ]
+                )
+            return
+
+        if ids != self._background_option_ids:
+            self._background_option_ids = ids
+            selected = (
+                self._selected_background_id
+                if self._selected_background_id in ids
+                else ids[-1]
+            )
+            self._selected_background_id = selected
+            option_list.set_options(
+                Option(self._background_option_prompt(state), id=state.id)
+                for state in states
+            )
+            if selected in ids:
+                option_list.highlighted = ids.index(selected)
+            return
+
+        for index, state in enumerate(states):
+            try:
+                option_list.replace_option_prompt_at_index(
+                    index, self._background_option_prompt(state)
+                )
+            except Exception:
+                pass
+
+    def _background_option_prompt(self, state: BackgroundState) -> Text:
+        if state.status == "running":
+            icon = SPINNER_FRAMES[self._spinner_index % len(SPINNER_FRAMES)]
+            style = "bold yellow"
+        else:
+            icon, style = BACKGROUND_STATUS_STYLES.get(
+                state.status, ("\u2022", "dim")
+            )
+
+        return Text.assemble(
+            (f"{icon} ", style),
+            (state.id, "bold"),
+            (f"  {_shorten(state.cmd, 28)}", "dim"),
+            (f"  {_format_elapsed(state.elapsed)}", "dim"),
+        )
+
+    def _update_background_header(self) -> None:
+        try:
+            header = self.query_one("#background-header", Static)
+        except Exception:
+            return
+
+        state = self._selected_background()
+        if state is None:
+            header.update(Text("No background task selected", style="dim"))
+            return
+
+        icon, style = BACKGROUND_STATUS_STYLES.get(
+            state.status, ("\u2022", "dim")
+        )
+        body = Text()
+        body.append(f"{icon} ", style=style)
+        body.append(state.id, style="bold yellow")
+        body.append(f"  {state.status}", style=style)
+        body.append(f"  {_format_elapsed(state.elapsed)}", style="dim")
+        if state.return_code is not None:
+            body.append(f"  rc={state.return_code}", style="dim")
+        body.append("\n")
+        body.append("Command: ", style="dim")
+        body.append(state.cmd)
+        if state.error:
+            body.append("\n")
+            body.append("Error: ", style="dim")
+            body.append(state.error, style="bold red")
+        header.update(body)
+
+    def _render_selected_background(self) -> None:
+        try:
+            log = self.query_one("#background-log", VerticalScroll)
+        except Exception:
+            return
+
+        log.remove_children()
+        state = self._selected_background()
+        if state is None:
+            log.mount(
+                Static(
+                    Text("No background task selected.", style="dim"),
+                    classes="message system-message",
+                )
+            )
+            self._update_background_header()
+            return
+
+        if state.status in {"running", "cancelling"}:
+            message = (
+                "Task is still running. Captured output will appear "
+                "here when it finishes."
+            )
+            if state.status == "running":
+                message += " Press x to stop it."
+            else:
+                message = "Stopping task\u2026"
+            log.mount(
+                Static(
+                    Text(message, style="dim"),
+                    classes="message system-message",
+                )
+            )
+            self._update_background_header()
+            return
+
+        body = Text()
+        body.append("Status    ", style="dim")
+        body.append(state.status, style="bold")
+        body.append("\n")
+        body.append("Command   ", style="dim")
+        body.append(state.cmd)
+        body.append("\n")
+        body.append("Duration  ", style="dim")
+        body.append(_format_elapsed(state.elapsed))
+        body.append("\n")
+        body.append("Exit code ", style="dim")
+        body.append(
+            "unknown" if state.return_code is None else str(state.return_code)
+        )
+        body.append("\n\nstdout\n", style="bold")
+        body.append(state.stdout or "(empty)")
+        body.append("\n\nstderr\n", style="bold")
+        body.append(state.stderr or "(empty)")
+        if state.error:
+            body.append("\n\nerror\n", style="bold red")
+            body.append(state.error, style="bold red")
+
+        log.mount(
+            Static(body, classes="message system-message")
+        )
+        self.call_after_refresh(self._scroll_background_log)
+        self._update_background_header()
+
+    def _scroll_background_log(self) -> None:
+        try:
+            self.query_one("#background-log", VerticalScroll).scroll_end(
+                animate=False
+            )
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     # history rendering
     # ------------------------------------------------------------------
     def _append_history(self, widget) -> None:
@@ -1205,6 +1784,14 @@ class HarnessApp(App):
             Static("You", classes="role user-role"),
             Static(Text(query)),
             classes="message user-message",
+        )
+        self._append_history(block)
+
+    def _write_background_update(self, label: str) -> None:
+        block = Vertical(
+            Static("Background update", classes="role system-message"),
+            Static(Text(label)),
+            classes="message system-message",
         )
         self._append_history(block)
 
@@ -1375,7 +1962,7 @@ class HarnessApp(App):
         self._append_history(widget)
 
     def _start_tool_widget(self, name: str, body: str) -> None:
-        if name == "spawn_subagent":
+        if name in {"spawn_subagent", "spawn_subagents"}:
             return
 
         details = Static(Text(body), classes="tool-details")

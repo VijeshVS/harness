@@ -1,10 +1,12 @@
-import subprocess
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from openai.types.chat import ChatCompletionFunctionToolParam
 from openai.types.shared_params.function_definition import FunctionDefinition
+from config import settings
+from core.background import run_bash
 from core.subagent import run_subagent
 from schema.client import ToolModel
 from services.skills import SKILL_REGISTRY
@@ -12,18 +14,18 @@ from typing import List
 
 CURRENT_TODOS: list[dict] = []
 
-def run_bash_command(cmd: str) -> str:
+def run_bash_command(cmd: str, run_in_background: bool | None = None) -> str:
     """
-    Executes the bash command and returns stdout, stderr, return code
+    Executes the bash command and returns stdout, stderr, return code.
+
+    run_in_background=True starts it immediately in the background.
+    run_in_background=False keeps it in the foreground.
+    run_in_background=None uses hybrid execution: short commands stay in the
+    foreground, while likely long-running commands are adopted after a grace
+    period and report their result in an automated follow-up turn.
     """
-    result = subprocess.run(cmd,shell=True,capture_output=True,text=True)
-    parsed_result = {
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-        "return_code": result.returncode
-    }
-    return json.dumps(parsed_result)
-    
+    return json.dumps(run_bash(cmd, run_in_background))
+
 def read_file(path: str, offset: int = 0, limit: int | None = None) -> str:
     """
     Reads the file and returns the requested lines
@@ -132,6 +134,32 @@ def spawn_subagent(agent_name: str, query: str) -> str:
 
     return run_subagent(agent_name, query)
 
+def spawn_subagents(tasks: list[dict]) -> str:
+    """Spawns multiple sub-agents in parallel and returns all results."""
+
+    requests = [
+        (str(task.get("agent_name", "")), str(task.get("query", "")))
+        for task in tasks
+    ]
+    if not requests:
+        return "No sub-agents requested."
+
+    max_workers = min(settings.subagents.max_parallel, len(requests))
+    results: list[str] = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(run_subagent, agent_name, query)
+            for agent_name, query in requests
+        ]
+        for future in futures:
+            try:
+                results.append(future.result())
+            except Exception as error:
+                results.append(f"Subagent failed: {error}")
+
+    return "\n".join(results)
+
 def load_skill(name: str) -> str:
     skill = SKILL_REGISTRY.get(name)
     if not skill:
@@ -140,12 +168,16 @@ def load_skill(name: str) -> str:
     return skill["content"]
 
 TOOL_DEFNS: List[ToolModel] = [
-    ToolModel(name="run_bash_command",description="Executes a bash command and returns stdout, stderr, and the return code.",parameters={
+    ToolModel(name="run_bash_command",description="Executes a bash command and returns stdout, stderr, and the return code. Set run_in_background=true for long-running work, or leave it unset for hybrid execution.",parameters={
                 "type": "object",
                 "properties": {
                     "cmd": {
                         "type": "string",
                         "description": "The bash command to execute.",
+                    },
+                    "run_in_background": {
+                        "type": "boolean",
+                        "description": "True runs immediately in the background. False keeps the command in the foreground. Omit for hybrid execution, where likely long-running commands are adopted into the background after a short grace period.",
                     }
                 },
                 "required": ["cmd"],
@@ -242,7 +274,7 @@ TOOL_DEFNS: List[ToolModel] = [
                 },
                 "required": ["todos"],
     }),
-    ToolModel(name="spawn_subagent",description="Spawns a sub-agent with the given name and query.",parameters={
+    ToolModel(name="spawn_subagent",description="Spawns a single sub-agent with the given name and query. For two or more independent tasks, use spawn_subagents instead.",parameters={
                 "type": "object",
                 "properties": {
                     "agent_name": {
@@ -255,6 +287,30 @@ TOOL_DEFNS: List[ToolModel] = [
                     }
                 },
                 "required": ["agent_name", "query"],
+    }),
+    ToolModel(name="spawn_subagents",description="Spawns multiple independent sub-agents in parallel and returns all of their results together.",parameters={
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "description": "Independent tasks to run concurrently.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "agent_name": {
+                                    "type": "string",
+                                    "description": "The name of the sub-agent to spawn.",
+                                },
+                                "query": {
+                                    "type": "string",
+                                    "description": "The query to pass to the sub-agent.",
+                                },
+                            },
+                            "required": ["agent_name", "query"],
+                        },
+                    }
+                },
+                "required": ["tasks"],
     }),
     ToolModel(name="load_skill",description="Loads the full instructions for a skill by name.",parameters={
                 "type": "object",
@@ -276,6 +332,7 @@ TOOL_MAPPING = {
     "search_files": search_files,
     "search_code": search_code,
     "spawn_subagent": spawn_subagent,
+    "spawn_subagents": spawn_subagents,
     "run_todo_write": run_todo_write,
     "load_skill": load_skill
 }
