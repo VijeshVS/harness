@@ -35,6 +35,7 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
+from config import settings
 from core.agent import run_turn
 from core.background import (
     BackgroundEvent,
@@ -44,7 +45,7 @@ from core.background import (
     terminate_background_task,
     terminate_background_tasks,
 )
-from core.compact import compact_messages
+from core.compact import compact_messages, measure_context
 from core.output import clear_output_listener, set_output_listener
 from core.subagent import (
     SubagentEvent,
@@ -362,6 +363,15 @@ class HarnessApp(App):
         height: 1fr;
     }
 
+    #context-stats {
+        width: 1fr;
+        height: auto;
+        margin: 0 0 1 0;
+        padding: 0 1;
+        border: round $secondary;
+        background: $surface;
+    }
+
     #todos {
         width: 1fr;
         height: 1fr;
@@ -613,6 +623,7 @@ class HarnessApp(App):
         self._selected_background_id: str | None = None
         self._background_option_ids: list[str] = []
         self._background_tick = 0
+        self._context_signature: tuple[int, int, int] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -631,6 +642,7 @@ class HarnessApp(App):
                     id="loading",
                 )
             with Vertical(id="sidebar"):
+                yield Static("", id="context-stats")
                 yield RichLog(
                     id="todos",
                     markup=False,
@@ -658,6 +670,7 @@ class HarnessApp(App):
 
     def on_mount(self) -> None:
         self.query_one("#history-panel").border_title = "Conversation"
+        self.query_one("#context-stats", Static).border_title = "Context"
         self.query_one("#todos", RichLog).border_title = "Todos"
         self.query_one("#subagent-list", OptionList).border_title = "Subagents"
         self.query_one("#background-list", OptionList).border_title = "Background"
@@ -671,8 +684,10 @@ class HarnessApp(App):
         self.set_interval(0.08, self._tick_spinner)
         self.set_interval(0.5, self._tick_subagents)
         self.set_interval(0.5, self._tick_background_tasks)
+        self.set_interval(0.5, self._refresh_context_stats)
 
         self._refresh_todos()
+        self._refresh_context_stats()
         self._refresh_subagent_list()
         self._refresh_background_list()
         self._refresh_turn_queue()
@@ -937,6 +952,7 @@ class HarnessApp(App):
     def _finish_turn(self) -> None:
         self._busy = False
         self._set_loading(False)
+        self._refresh_context_stats()
 
         failed = self._failed_request
         self._failed_request = None
@@ -2078,6 +2094,49 @@ class HarnessApp(App):
             classes="tool-call",
         )
         self._append_history(collapsible)
+
+    # ------------------------------------------------------------------
+    # context stats
+    # ------------------------------------------------------------------
+    def _refresh_context_stats(self) -> None:
+        try:
+            panel = self.query_one("#context-stats", Static)
+        except Exception:
+            return
+
+        stats = measure_context(self.messages)
+        limit = settings.compaction.max_context_chars
+        percent = stats.chars / limit * 100 if limit else 0.0
+        signature = (stats.chars, stats.messages, int(percent * 10))
+        if signature == self._context_signature:
+            return
+        self._context_signature = signature
+
+        if percent < 50:
+            style = "green"
+        elif percent < 80:
+            style = "yellow"
+        else:
+            style = "bold red"
+
+        bar_width = 18
+        filled = min(bar_width, int(percent / 100 * bar_width))
+        body = Text()
+        body.append("Length    ", style="dim")
+        body.append(
+            f"{stats.chars:,} / {limit:,} chars", style="bold"
+        )
+        body.append("\nUtilized  ", style="dim")
+        body.append(f"{percent:.1f}%", style=style)
+        body.append("  ")
+        body.append("\u2588" * filled, style=style)
+        body.append("\u2591" * (bar_width - filled), style="dim")
+        body.append("\nMessages  ", style="dim")
+        body.append(str(stats.messages), style="bold")
+        body.append("\nDirectory ", style="dim")
+        body.append("\n")
+        body.append(str(WORKDIR))
+        panel.update(body)
 
     # ------------------------------------------------------------------
     # todos

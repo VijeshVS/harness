@@ -365,6 +365,12 @@ def needs_compaction(messages: List[ChatCompletionMessageParam]) -> bool:
     return _snapshot(messages).chars > settings.compaction.max_context_chars
 
 
+def measure_context(
+    messages: List[ChatCompletionMessageParam],
+) -> CompactionStats:
+    return _snapshot(cast(List[Message], messages))
+
+
 def compact_messages(
     messages: List[ChatCompletionMessageParam],
 ) -> List[ChatCompletionMessageParam]:
