@@ -483,6 +483,10 @@ class HarnessApp(App):
         border: tall $accent;
     }
 
+    #query.view-hidden {
+        display: none;
+    }
+
     .message {
         height: auto;
         margin: 0 0 1 0;
@@ -1095,8 +1099,16 @@ class HarnessApp(App):
             self._refresh_background_list()
             self._render_selected_background()
 
+    def _set_query_visible(self, visible: bool) -> None:
+        query = self.query_one("#query", Input)
+        if visible:
+            query.remove_class("view-hidden")
+        else:
+            query.add_class("view-hidden")
+
     def _show_subagent_view(self) -> None:
         self._hide_suggestions()
+        self._set_query_visible(False)
         self._view_mode = "subagents"
         self.query_one("#history").add_class("hidden")
         self.query_one("#background-view").remove_class("visible")
@@ -1120,6 +1132,7 @@ class HarnessApp(App):
 
     def _show_background_view(self) -> None:
         self._hide_suggestions()
+        self._set_query_visible(False)
         self._view_mode = "background"
         self.query_one("#history").add_class("hidden")
         self.query_one("#subagent-view").remove_class("visible")
@@ -1143,6 +1156,7 @@ class HarnessApp(App):
 
     def _show_main_view(self) -> None:
         self._view_mode = "main"
+        self._set_query_visible(True)
         self.query_one("#subagent-view").remove_class("visible")
         self.query_one("#background-view").remove_class("visible")
         self.query_one("#history").remove_class("hidden")
@@ -1985,7 +1999,7 @@ class HarnessApp(App):
         collapsible = Collapsible(
             details,
             title=f"\U0001f527 {name}",
-            collapsed=name not in FILE_TOOLS,
+            collapsed=name != "write_file",
             classes="tool-call",
         )
         self._active_tool_details = details
@@ -2016,7 +2030,7 @@ class HarnessApp(App):
 
         args = _tool_args(tool)
         path = args.get("path")
-        if not isinstance(path, str) or not _inside_workspace(path):
+        if not isinstance(path, str) or not path:
             return
 
         try:
@@ -2051,7 +2065,7 @@ class HarnessApp(App):
         path = str(args.get("path", ""))
 
         if name == "write_file":
-            if not _inside_workspace(path):
+            if not path:
                 return
             tool_id = str(getattr(tool, "id", ""))
             saved_path, old = self._write_snapshots.pop(
@@ -2064,6 +2078,7 @@ class HarnessApp(App):
                 new = str(args.get("content", ""))
             rendered = render_diff(path, old, new)
             title = f"\U0001f4dd write_file \u00b7 {_shorten(path, 60)}"
+            collapsed = False
         else:
             stdout, error = _parse_read_result(result)
             if error:
@@ -2078,19 +2093,27 @@ class HarnessApp(App):
                     start_line = 1
                 rendered = render_contents(path, stdout, start_line)
             title = f"\U0001f4d6 read_file \u00b7 {_shorten(path, 60)}"
+            collapsed = True
 
         self._suppress_next_tool = name
         try:
-            self.call_from_thread(self._append_file_view, title, rendered)
+            self.call_from_thread(
+                self._append_file_view, title, rendered, collapsed
+            )
         except RuntimeError:
             pass
 
-    def _append_file_view(self, title: str, rendered: Text) -> None:
+    def _append_file_view(
+        self,
+        title: str,
+        rendered: Text,
+        collapsed: bool = False,
+    ) -> None:
         details = Static(rendered, classes="file-view")
         collapsible = Collapsible(
             details,
             title=escape(title),
-            collapsed=False,
+            collapsed=collapsed,
             classes="tool-call",
         )
         self._append_history(collapsible)
@@ -2261,13 +2284,6 @@ def _shorten(text: str, limit: int = 600) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "\u2026"
-
-
-def _inside_workspace(path: str) -> bool:
-    try:
-        return Path(path).resolve().is_relative_to(WORKDIR.resolve())
-    except (OSError, ValueError):
-        return False
 
 
 def _tool_name(body: str) -> str:
