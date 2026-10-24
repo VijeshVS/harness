@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -11,10 +12,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from services.permission import ask_user
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 _TAG_RE = re.compile(
-    r"^\[(llm|tool|system|session|summary|compact|todos|error|command|stop-reason|skill)\]\s?(.*)$"
+    r"^\[(llm|tool|system|session|summary|compact|todos|error|command|stop-reason|skill|permission)\]\s?(.*)$"
 )
 
 _TAG_KINDS = {
@@ -113,6 +116,7 @@ def run_subagent(agent_name: str, query: str) -> str:
         proc = subprocess.Popen(
             command,
             cwd=str(PROJECT_ROOT),
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -145,8 +149,14 @@ def run_subagent(agent_name: str, query: str) -> str:
             )
         )
     finally:
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
+        if proc is not None:
+            if proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+            if proc.poll() is None:
+                proc.terminate()
         with _procs_lock:
             _procs.pop(subagent_id, None)
 
@@ -248,6 +258,12 @@ def _consume_output(
                 current_kind = "status"
                 continue
 
+            if tag == "permission":
+                finalize_llm()
+                current_kind = "status"
+                _handle_permission_request(proc, body)
+                continue
+
             kind = _TAG_KINDS.get(tag, "status")
             if tag == "llm":
                 finalize_llm()
@@ -268,6 +284,38 @@ def _consume_output(
 
     finalize_llm()
     return last_llm
+
+
+def _handle_permission_request(
+    proc: subprocess.Popen[str],
+    body: str,
+) -> None:
+    try:
+        request = json.loads(body)
+        tool_name = str(request.get("tool", ""))
+        arguments = request.get("args") or {}
+        reason = str(request.get("reason", ""))
+    except (TypeError, ValueError):
+        _respond_to_permission(proc, False)
+        return
+
+    if not isinstance(arguments, dict):
+        arguments = {"value": arguments}
+
+    _respond_to_permission(proc, ask_user(tool_name, arguments, reason))
+
+
+def _respond_to_permission(
+    proc: subprocess.Popen[str],
+    allow: bool,
+) -> None:
+    if proc.stdin is None:
+        return
+    try:
+        proc.stdin.write("y\n" if allow else "n\n")
+        proc.stdin.flush()
+    except (BrokenPipeError, OSError, ValueError):
+        pass
 
 
 def _publish_output(
